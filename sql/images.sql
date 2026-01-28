@@ -1,0 +1,10 @@
+CREATE TABLE IF NOT EXISTS images(
+  id BIGSERIAL PRIMARY KEY,
+  device_id TEXT NOT NULL,
+  ts TIMESTAMPTZ NOT NULL DEFAULT now(),
+  key TEXT NOT NULL UNIQUE,
+  sha256 TEXT NOT NULL,
+  mime TEXT,
+  width INT, height INT,
+  created_at TIMESTAMPTZ DEFAULT now()
+);
