@@ -1,0 +1,18 @@
+# env / secrets
+.env
+*.env
+**/.env
+
+# docker volumes / local state
+pgdata/
+minio-data/
+__pycache__/
+*.pyc
+
+# logs
+*.log
+
+# OS/editor
+.DS_Store
+.vscode/
+docker/
