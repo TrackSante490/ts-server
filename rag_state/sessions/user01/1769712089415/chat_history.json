@@ -1,0 +1,10 @@
+[
+  {
+    "role": "user",
+    "content": "hi my chest hurts"
+  },
+  {
+    "role": "assistant",
+    "content": "{\n  \"assistant_message\": \"I'm here to help you with your chest pain. Can you tell me when did this pain start and how long have you been experiencing it?\",\n  \"questions_to_ask\": [\n    \"When did this pain start and how long have you been experiencing it?\",\n    \"Where exactly is the pain located in your chest? Does it radiate to your arm, jaw, or back?\",\n    \"Can you describe the character of the pain? Is it sharp, pressure-like, burning, or something else?\",\n    \"On a scale of 0-10, how would you rate the severity of this pain?\"\n  ],\n  \"collected_facts\": {},\n  \"triage_flags\": [],\n  \"suggested_next_step\": \"continue_intake\",\n  \"recommended_measurements\": [],\n  \"sources\": [\"chest_pain.md\", \"module_info.md\"]\n}"
+  }
+]

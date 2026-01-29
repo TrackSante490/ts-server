@@ -1,0 +1,10 @@
+[
+  {
+    "role": "user",
+    "content": "I am feeling irregular chain pain"
+  },
+  {
+    "role": "assistant",
+    "content": "{\n  \"assistant_message\": \"Sorry to hear that you're experiencing irregular chest pain. Can you tell me more about what's been happening? When did it start and how often does it occur?\",\n  \"questions_to_ask\": [\"When did it start\", \"How often does it occur\"],\n  \"collected_facts\": {},\n  \"triage_flags\": [],\n  \"suggested_next_step\": \"continue_intake\",\n  \"recommended_measurements\": [],\n  \"sources\": []\n}"
+  }
+]

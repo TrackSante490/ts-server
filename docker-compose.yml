@@ -4,30 +4,53 @@ services:
     restart: unless-stopped
     working_dir: /app
     command: >
-      bash -lc "pip install --no-cache-dir 'fastapi' 'uvicorn[standard]' 'pydantic' 'boto3' 'psycopg[binary]' 'pillow' 'python-multipart' && uvicorn app:app --host 0.0.0.0 --port 8080"
+      bash -lc "pip install --no-cache-dir -r requirements.txt && uvicorn app:app --host 0.0.0.0 --port 8080"
     volumes:
       - ./api:/app
+      - ./cappie_run:/cappie_run
+      # persist rag_state sessions outside the container so they don't vanish
+      - ./rag_state:/cappie_run/rag_state
+      # Optional: persist Chroma DB on the host
+      - ./vectordb:/cappie_run/vectordb
     env_file:
       - .env
     environment:
-      DATABASE_URL: postgresql://postgres:postgres@db:5432/postgres
-      S3_ENDPOINT: http://minio:9000
-      S3_ACCESS_KEY: minio
-      S3_SECRET_KEY: minio123
-      S3_BUCKET_IMAGES: images
+      # Keep PYTHONPATH so api can import cappie_run modules
+      PYTHONPATH: "/app:/cappie_run"
+
+      # Read from .env (single source of truth)
+      DATABASE_URL: ${DATABASE_URL}
+      S3_ENDPOINT: ${S3_ENDPOINT}
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY}
+      S3_SECRET_KEY: ${S3_SECRET_KEY}
+      S3_BUCKET_IMAGES: ${S3_BUCKET_IMAGES}
+      
+      # RAG / Ollama config
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL}
+      OLLAMA_CHAT_MODEL: ${OLLAMA_CHAT_MODEL}
+      OLLAMA_EMBED_MODEL: ${OLLAMA_EMBED_MODEL}
     ports:
       - "8080:8080"
     depends_on:
       - db
       - minio
+      - ollama
 
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    volumes:
+      - ollama-data:/root/.ollama
+      # We do NOT expose 11434 publicly here.
+      # api talks to it internally via http://ollama:11434
 
   db:
     image: postgres:16
     restart: unless-stopped
     environment:
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-postgres}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
     volumes:
       - ./pgdata:/var/lib/postgresql/data
     ports:
@@ -38,20 +61,13 @@ services:
     restart: unless-stopped
     command: server /data --console-address ":9001"
     environment:
-      MINIO_ROOT_USER: minio
-      MINIO_ROOT_PASSWORD: minio123
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY}
     volumes:
       - ./minio-data:/data
     ports:
       - "9000:9000"  # S3 API
       - "9001:9001"  # Web console
-
-  adminer:
-    image: adminer
-    restart: unless-stopped
-    ports:
-      - "8081:8080"
-
 
   mc-init:
     image: minio/mc
@@ -60,7 +76,15 @@ services:
       - minio
     entrypoint: >
       /bin/sh -c "
-      mc alias set local http://minio:9000 minio minio123 &&
-      mc mb -p local/images || true
+      mc alias set local ${S3_ENDPOINT} ${S3_ACCESS_KEY} ${S3_SECRET_KEY} &&
+      mc mb -p local/${S3_BUCKET_IMAGES} || true
       "
+
+  adminer:
+    image: adminer
+    restart: unless-stopped
+    ports:
+      - "8081:8080"
     
+volumes:
+  ollama-data:

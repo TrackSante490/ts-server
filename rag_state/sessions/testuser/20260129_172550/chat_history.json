@@ -1,0 +1,10 @@
+[
+  {
+    "role": "user",
+    "content": "I have headaches"
+  },
+  {
+    "role": "assistant",
+    "content": "{\n  \"assistant_message\": \"I'm here to help you with your headaches. Can you tell me more about them? When did they start and how long have you been experiencing them?\",\n  \"questions_to_ask\": [\n    \"Where exactly do you feel the pain in your head?\",\n    \"Does the pain radiate to any other areas, such as your arm or jaw?\",\n    \"Can you describe the character of the pain (e.g. pressure, sharp, burning)?\",\n    \"On a scale of 0-10, how would you rate the severity of your headaches?\"\n  ],\n  \"collected_facts\": {},\n  \"triage_flags\": [],\n  \"suggested_next_step\": \"continue_intake\",\n  \"recommended_measurements\": [],\n  \"sources\": []\n}"
+  }
+]

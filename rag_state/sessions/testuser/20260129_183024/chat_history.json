@@ -1,0 +1,10 @@
+[
+  {
+    "role": "user",
+    "content": "ping"
+  },
+  {
+    "role": "assistant",
+    "content": "{\n  \"assistant_message\": \"Hello! I'm here to help you track your health. Can you please tell me about any symptoms or concerns you're experiencing today?\",\n  \"questions_to_ask\": [\n    \"What's been going on with your body that's causing you concern?\",\n    \"Have you experienced any chest pain, shortness of breath, or other concerning symptoms?\"\n  ],\n  \"collected_facts\": {},\n  \"triage_flags\": [],\n  \"suggested_next_step\": \"continue_intake\",\n  \"recommended_measurements\": [],\n  \"sources\": [\"chest_pain.md\"]\n}"
+  }
+]

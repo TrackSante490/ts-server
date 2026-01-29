@@ -1,0 +1,18 @@
+[
+  {
+    "role": "user",
+    "content": "hi!"
+  },
+  {
+    "role": "assistant",
+    "content": "{\n  \"assistant_message\": \"Hello! I'm here to help you with your health concerns. Can you please tell me what brings you here today?\",\n  \"questions_to_ask\": [\"What's been going on, and how can I assist you?\"],\n  \"collected_facts\": {},\n  \"triage_flags\": [],\n  \"suggested_next_step\": \"continue_intake\",\n  \"recommended_measurements\": [],\n  \"sources\": []\n}"
+  },
+  {
+    "role": "user",
+    "content": "whats 2x2?"
+  },
+  {
+    "role": "assistant",
+    "content": "{\n  \"assistant_message\": \"That's a math question! I'm here to help with your health concerns, though.\",\n  \"questions_to_ask\": [\"Can you please tell me what's been going on, and how can I assist you?\"],\n  \"collected_facts\": {},\n  \"triage_flags\": [],\n  \"suggested_next_step\": \"continue_intake\",\n  \"recommended_measurements\": [],\n  \"sources\": []\n}"
+  }
+]

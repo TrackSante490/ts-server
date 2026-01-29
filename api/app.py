@@ -3,6 +3,7 @@ import os, io, time, hashlib
 from typing import Optional
 from datetime import datetime, timezone
 from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException, Query
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 import boto3, psycopg
 from psycopg.types import json as psyjson  # (optional, handy if you use psyjson.Json)
@@ -42,6 +43,11 @@ class Telemetry(BaseModel):
     ts: Optional[datetime] = None
     seq: Optional[int] = None
     metrics: dict[str, float] = Field(default_factory=dict)
+
+class ChatReq(BaseModel):
+    user_id: str
+    message: str
+    session_id: str | None = None
 
 def auth_device(authorization: Optional[str], device_id: str):
     if not authorization or not authorization.startswith("Bearer "):
@@ -152,3 +158,15 @@ def list_images(device_id: str | None = None, limit: int = 20):
         rows = cur.fetchall()
     return [ImgRow(id=r[0], device_id=r[1], ts=r[2], key=r[3], sha256=r[4],
                    mime=r[5], width=r[6], height=r[7]) for r in rows]
+
+@app.post("/api/chat")
+async def chat(req: ChatReq, authorization: str | None = Header(None)):
+    # optional: reuse your API_KEYS auth (or leave open for now)
+    # auth_device(authorization, "kit-001")
+    from rag_conv.rag_agent import chat_once
+    return await run_in_threadpool(
+        chat_once,
+        user_id=req.user_id,
+        user_message=req.message,
+        session_id=req.session_id
+    )

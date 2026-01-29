@@ -1,0 +1,6 @@
+● ollama.service - Ollama Service
+     Loaded: loaded (]8;;file://chickenalfredo-B650M-GAMING-PLUS-WIFI/etc/systemd/system/ollama.service/etc/systemd/system/ollama.service]8;;; [0;1;32menabled[0m; preset: [0;1;32menabled[0m)
+     Active: activating (auto-restart) (Result: exit-code) since Thu 2026-01-29 01:23:58 EST; 502ms ago
+    Process: 1300670 ExecStart=/usr/local/bin/ollama serve [0;1;31m(code=exited, status=1/FAILURE)[0m
+   Main PID: 1300670 (code=exited, status=1/FAILURE)
+        CPU: 11ms

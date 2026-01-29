@@ -1,0 +1,15 @@
+fastapi
+uvicorn[standard]
+pydantic
+boto3
+psycopg[binary]
+pillow
+python-multipart
+
+langchain
+langchain-core
+langchain-text-splitters
+langchain-ollama
+langchain-chroma
+chromadb
+python-frontmatter
