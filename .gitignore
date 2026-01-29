@@ -19,7 +19,9 @@ docker/
 cappie_run/
 
 # runtime state (should never be committed)
+logs/
 rag_state/
 vectordb/
 *.sqlite3
 *.bin
+*.deployed_sha
