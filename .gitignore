@@ -17,3 +17,9 @@ __pycache__/
 .vscode/
 docker/
 cappie_run/
+
+# runtime state (should never be committed)
+rag_state/
+vectordb/
+*.sqlite3
+*.bin
