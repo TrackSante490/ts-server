@@ -13,3 +13,4 @@ langchain-ollama
 langchain-chroma
 chromadb
 python-frontmatter
+PyJWT==2.10.1

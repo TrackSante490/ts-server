@@ -1,0 +1,343 @@
+/* ===== TrackSanté Authentik skin (LIGHT, login-only) ===== */
+
+/* -------------------------------
+   0) IMPORTANT: Do NOT break admin
+   - Only do global overflow-x hidden (safe)
+   - Everything else scoped to .pf-c-login
+   ------------------------------- */
+
+/* Prevent LEFT/RIGHT scroll everywhere (does NOT kill admin vertical scroll) */
+html, body {
+  overflow-x: hidden !important;
+}
+
+/* 1) Login page background (TrackSanté beige) */
+.pf-c-login .pf-c-background-image,
+.pf-c-login .pf-c-background-image::before,
+.pf-c-login .pf-c-background-image::after {
+  background: #f2ede3 !important;
+  background-image: none !important;
+}
+
+/* 2) Center the login layout (login only) */
+.pf-c-login {
+  min-height: 100vh !important;
+  width: 100% !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  padding: 24px !important;
+
+  /* key: stop sideways panning but keep admin untouched */
+  overflow-x: hidden !important;
+}
+
+/* 3) Constrain login container */
+.pf-c-login .pf-c-login__container {
+  width: min(720px, calc(100vw - 48px)) !important;
+  margin: 0 auto !important;
+}
+
+/* 4) The main “Flutter card” */
+.pf-c-login .pf-c-login__main {
+  width: 100% !important;
+  background: #ffffff !important;
+  border-radius: 40px !important;
+  box-shadow: 0 18px 45px rgba(0,0,0,0.18) !important;
+  padding: 48px 48px 36px 48px !important;
+
+  /* key: avoid inner overflow causing horizontal scroll */
+  overflow-x: hidden !important;
+}
+
+/* 5b) Hide "Welcome to authentik!" inside ak-stage-identification shadow DOM
+   Using ::part is the only reliable way from outside the shadow root. */
+.pf-c-login ak-stage-identification::part(title),
+.pf-c-login ak-stage-password::part(title) {
+  display: none !important;
+}
+
+/* 6) Keep logo and make it big + centered */
+.pf-c-login .pf-c-login__main-header,
+.pf-c-login .pf-c-login__header,
+.pf-c-login .pf-c-brand,
+.pf-c-login .pf-c-login__main-header.pf-c-brand.ak-brand {
+  display: flex !important;
+  justify-content: center !important;
+  align-items: center !important;
+  margin: 0 0 18px 0 !important;
+}
+
+.pf-c-login .pf-c-brand img,
+.pf-c-login .pf-c-brand picture img,
+.pf-c-login .pf-c-login__main-header.pf-c-brand.ak-brand img,
+.pf-c-login .pf-c-login__main-header.pf-c-brand.ak-brand picture img {
+  width: 200px !important;     /* adjust: 140 / 160 / 200 */
+  height: auto !important;
+  max-width: none !important;
+  max-height: none !important;
+  object-fit: contain !important;
+  padding: 0 !important;
+  margin: 0 auto !important;
+}
+
+/* 7) Form spacing */
+.pf-c-login .pf-c-login__main-body {
+  margin-top: 8px !important;
+}
+.pf-c-login .pf-c-form__group {
+  margin-bottom: 18px !important;
+}
+
+/* 8) Labels */
+.pf-c-login label,
+.pf-c-login .pf-c-form__label-text {
+  color: #1f2a21 !important;
+  font-weight: 650 !important;
+}
+
+/* 9) Inputs (rounded, soft border) */
+.pf-c-login input,
+.pf-c-login .pf-c-form-control,
+.pf-c-login .pf-c-text-input-group__text-input {
+  background: #ffffff !important;
+  border: 2px solid rgba(0,0,0,0.10) !important;
+  border-radius: 12px !important;
+  color: #111 !important;
+  padding: 14px 14px !important;
+  box-shadow: none !important;
+  max-width: 100% !important;
+}
+
+.pf-c-login input:focus,
+.pf-c-login .pf-c-form-control:focus,
+.pf-c-login .pf-c-text-input-group__text-input:focus {
+  outline: none !important;
+  border-color: rgba(63,107,74,0.45) !important;
+}
+
+/* 9.5) FIX: username visibility on password step (your akaadmin was there but too faint) */
+.pf-c-login .form-control-static,
+.pf-c-login .form-control-static *,
+.pf-c-login .pf-c-form__group-control .form-control-static,
+.pf-c-login .pf-c-form__group-control .form-control-static * {
+  color: #1f2a21 !important;
+  opacity: 1 !important;
+  visibility: visible !important;
+}
+
+/* 10) Primary button (green pill) */
+.pf-c-login button.pf-m-primary,
+.pf-c-login .pf-c-button.pf-m-primary {
+  width: 100% !important;
+  background: #3f6b4a !important;
+  border: none !important;
+  border-radius: 999px !important;
+  padding: 16px 18px !important;
+  font-weight: 750 !important;
+  font-size: 18px !important;
+}
+
+.pf-c-login button.pf-m-primary:hover,
+.pf-c-login .pf-c-button.pf-m-primary:hover {
+  filter: brightness(0.98) !important;
+}
+
+/* 11) Remove “Powered by authentik” footer (login only) */
+.pf-c-login .pf-c-login__main-footer,
+.pf-c-login .pf-c-login__main-footer-band,
+.pf-c-login .pf-c-login__main-footer-links,
+.pf-c-login .pf-c-login__footer,
+.pf-c-login footer.pf-c-login__footer,
+.pf-c-login footer.pf-c-login__main-footer,
+.pf-c-login footer.pf-c-login__main-footer * {
+  display: none !important;
+}
+
+/* 12) Prevent accidental horizontal growth from inner elements */
+.pf-c-login .pf-c-login__main,
+.pf-c-login .pf-c-login__container,
+.pf-c-login .pf-c-form,
+.pf-c-login .pf-c-form__group,
+.pf-c-login .pf-c-form__group-control,
+.pf-c-login .pf-c-form-control,
+.pf-c-login .pf-c-button {
+  max-width: 100% !important;
+}
+
+/* 13) Responsive tweak */
+@media (max-width: 520px) {
+  .pf-c-login .pf-c-login__main {
+    padding: 28px 22px 22px 22px !important;
+    border-radius: 28px !important;
+  }
+  .pf-c-login .pf-c-brand img,
+  .pf-c-login .pf-c-brand picture img,
+  .pf-c-login .pf-c-login__main-header.pf-c-brand.ak-brand img,
+  .pf-c-login .pf-c-login__main-header.pf-c-brand.ak-brand picture img {
+    width: 140px !important;
+  }
+}
+
+/* ===== TrackSanté: fix text contrast (login-only, includes shadow DOM) ===== */
+.pf-c-login {
+  /* These variables are consumed inside Authentik web-components (shadow DOM) */
+  --ak-dark-foreground: #1f2a21 !important;                 /* main text */
+  --ak-dark-muted-foreground: rgba(31, 42, 33, 0.70) !important;
+  --ak-accent: #3f6b4a !important;
+
+  /* PatternFly base text vars (also helps inside shadow DOM) */
+  --pf-global--Color--100: #1f2a21 !important;
+  --pf-global--Color--200: rgba(31, 42, 33, 0.70) !important;
+  --pf-global--link--Color: #3f6b4a !important;
+}
+
+/* Make sure the title + labels are actually using the dark text */
+.pf-c-login .pf-c-title,
+.pf-c-login h1,
+.pf-c-login label,
+.pf-c-login .pf-c-form__label-text {
+  color: #1f2a21 !important;
+  opacity: 1 !important;
+}
+
+/* Inputs text + placeholder contrast */
+.pf-c-login input,
+.pf-c-login .pf-c-form-control,
+.pf-c-login .pf-c-text-input-group__text-input {
+  color: #1f2a21 !important;
+  opacity: 1 !important;
+}
+
+.pf-c-login input::placeholder,
+.pf-c-login .pf-c-form-control::placeholder,
+.pf-c-login .pf-c-text-input-group__text-input::placeholder {
+  color: rgba(31, 42, 33, 0.55) !important;
+  opacity: 1 !important;
+}
+
+/* Username line (password step) tends to be "muted" */
+.pf-c-login .form-control-static,
+.pf-c-login .form-control-static * {
+  color: #1f2a21 !important;
+  opacity: 1 !important;
+}
+
+/* ================================
+   TrackSanté: style ALL flow inputs (not admin)
+   Scope: only pages that contain ak-flow-executor
+   ================================ */
+
+/* Labels in flows */
+ak-flow-executor label,
+ak-flow-executor .pf-c-form__label-text {
+  color: #1f2a21 !important;
+  font-weight: 650 !important;
+}
+
+/* Text inputs in flows */
+ak-flow-executor input,
+ak-flow-executor .pf-c-form-control,
+ak-flow-executor .pf-c-text-input-group__text-input {
+  background: #ffffff !important;
+  border: 2px solid rgba(0,0,0,0.10) !important;
+  border-radius: 12px !important;
+  color: #111 !important;                 /* typed text */
+  caret-color: #111 !important;
+  padding: 14px 14px !important;
+  box-shadow: none !important;
+}
+
+/* Placeholder color (so it doesn't look "invisible") */
+ak-flow-executor input::placeholder,
+ak-flow-executor .pf-c-form-control::placeholder,
+ak-flow-executor .pf-c-text-input-group__text-input::placeholder {
+  color: rgba(0,0,0,0.35) !important;
+  opacity: 1 !important;
+}
+
+/* Focus ring */
+ak-flow-executor input:focus,
+ak-flow-executor .pf-c-form-control:focus,
+ak-flow-executor .pf-c-text-input-group__text-input:focus {
+  outline: none !important;
+  border-color: rgba(63,107,74,0.45) !important;
+}
+
+/* ===== Fix: login inputs using Authentik dark vars ===== */
+
+/* Force light scheme on login page only */
+.pf-c-login {
+  color-scheme: light !important;
+}
+
+/* Override Authentik "dark" CSS vars inside the login flow (this is the real fix) */
+.pf-c-login ak-stage-identification,
+.pf-c-login ak-stage-password,
+.pf-c-login ak-stage-username,
+.pf-c-login ak-stage-authenticator-validate {
+  --ak-dark-background-light: #ffffff !important;
+  --ak-dark-background: #ffffff !important;
+  --ak-dark-foreground: #1f2a21 !important;
+  --ak-dark-foreground-muted: rgba(31, 42, 33, 0.65) !important;
+}
+
+/* Hard-force input look + typed text color (Safari needs -webkit-text-fill-color) */
+.pf-c-login input.pf-c-form-control,
+.pf-c-login .pf-c-form-control {
+  background-color: #ffffff !important;     /* or try: #f7f5ee */
+  color: #1f2a21 !important;
+  -webkit-text-fill-color: #1f2a21 !important;
+  border: 2px solid rgba(0,0,0,0.12) !important;
+}
+
+/* Placeholder */
+.pf-c-login input.pf-c-form-control::placeholder,
+.pf-c-login .pf-c-form-control::placeholder {
+  color: rgba(31, 42, 33, 0.55) !important;
+  opacity: 1 !important;
+}
+
+/* =========================================================
+   TrackSanté: force LIGHT input colors on ALL flow pages
+   (login + signup + any /if/flow/* pages)
+   Safe: does not affect admin UI
+   ========================================================= */
+
+ak-flow-executor {
+  color-scheme: light !important;
+
+  /* Override Authentik "dark" tokens used by PF form controls */
+  --ak-dark-background-light: #ffffff !important;
+  --ak-dark-background: #ffffff !important;
+  --ak-dark-foreground: #1f2a21 !important;
+  --ak-dark-foreground-muted: rgba(31, 42, 33, 0.65) !important;
+
+  /* PF text vars (helps labels + some inputs) */
+  --pf-global--Color--100: #1f2a21 !important;
+  --pf-global--Color--200: rgba(31, 42, 33, 0.70) !important;
+}
+
+/* Force typed text visibility everywhere in flows */
+ak-flow-executor input.pf-c-form-control,
+ak-flow-executor .pf-c-form-control,
+ak-flow-executor .pf-c-text-input-group__text-input {
+  background-color: #ffffff !important;
+  color: #1f2a21 !important;
+  -webkit-text-fill-color: #1f2a21 !important; /* Safari/Chromium sometimes needs this */
+  border: 2px solid rgba(0,0,0,0.12) !important;
+  border-radius: 12px !important;
+}
+
+ak-flow-executor input::placeholder,
+ak-flow-executor .pf-c-form-control::placeholder,
+ak-flow-executor .pf-c-text-input-group__text-input::placeholder {
+  color: rgba(31, 42, 33, 0.55) !important;
+  opacity: 1 !important;
+}
+
+ak-flow-executor label,
+ak-flow-executor .pf-c-form__label-text {
+  color: #1f2a21 !important;
+  opacity: 1 !important;
+}

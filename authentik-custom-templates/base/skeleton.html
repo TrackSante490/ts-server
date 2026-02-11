@@ -1,0 +1,89 @@
+<title>TRACKSANTE TEST</title>
+{% load static %}
+{% load i18n %}
+{% load authentik_core %}
+
+<!DOCTYPE html>
+
+<html>
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+        {# Darkreader breaks the site regardless of theme as its not compatible with webcomponents, and we default to a dark theme based on preferred colour-scheme #}
+        <meta name="darkreader-lock">
+        <title>{% block title %}{% trans title|default:brand.branding_title %}{% endblock %}</title>
+        <link rel="icon" href="{{ brand.branding_favicon_url }}">
+        <link rel="shortcut icon" href="{{ brand.branding_favicon_url }}">
+        {% block head_before %}
+        {% endblock %}
+        <link rel="stylesheet" type="text/css" href="{% static 'dist/authentik.css' %}">
+        <link rel="stylesheet" type="text/css" href="{% static 'dist/custom.css' %}?v=1" data-inject>
+        <style>
+            /* App background */
+            html, body {
+                height: 100%;
+                background: #0f1115 !important;
+            }
+
+            /* Kill flow background image entirely (even if set) */
+            :root { --ak-flow-background: none !important; }
+            ak-flow-executor::part(background),
+            ak-flow-executor::part(container) {
+                background: transparent !important;
+            }
+
+            /* Center the flow content like your Flutter card screen */
+            ak-flow-executor {
+                min-height: 100vh !important;
+                display: grid !important;
+                place-items: center !important;
+                padding: 24px !important;
+            }
+
+            /* Card look (most important) */
+            ak-flow-executor::part(card),
+            ak-flow-executor::part(content),
+            .pf-c-card,
+            .pf-c-login__main {
+                max-width: 420px !important;
+                width: 100% !important;
+                background: #171a21 !important;
+                border: 1px solid rgba(255,255,255,0.08) !important;
+                border-radius: 16px !important;
+                box-shadow: 0 12px 40px rgba(0,0,0,0.45) !important;
+                padding: 24px !important;
+            }
+
+            /* Inputs */
+            input, .pf-c-form-control {
+                background: #10131a !important;
+                border: 1px solid rgba(255,255,255,0.12) !important;
+                border-radius: 12px !important;
+                color: #e9eef7 !important;
+            }
+
+            /* Primary button */
+            button.pf-m-primary, .pf-c-button.pf-m-primary {
+                border-radius: 12px !important;
+                padding: 10px 14px !important;
+                font-weight: 600 !important;
+            }
+
+            /* Hide "Powered by authentik" */
+            ak-interface-footer, .pf-c-login__footer {
+                display: none !important;
+            }
+        </style>
+        <script src="{% versioned_script 'dist/poly-%v.js' %}" type="module"></script>
+        <script src="{% versioned_script 'dist/standalone/loading/index-%v.js' %}" type="module"></script>
+        {% block head %}
+        {% endblock %}
+        <meta name="sentry-trace" content="{{ sentry_trace }}" />
+    </head>
+    <body>
+        {% block body %}
+        {% endblock %}
+        {% block scripts %}
+        {% endblock %}
+    </body>
+</html>

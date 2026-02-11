@@ -1,0 +1,151 @@
+{% load authentik_stages_email %}
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml">
+  <head>
+    <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+    <meta name="viewport" content="width=device-width">
+
+    <style type="text/css">
+      body {
+        margin: 0;
+        padding: 0;
+        background: #f6f7f9;
+        font-family: Arial, sans-serif;
+        font-size: 14px;
+        color: #212124;
+      }
+
+      .container {
+        width: 100%;
+        max-width: 520px;
+        margin: 0 auto;
+        padding: 40px 16px;
+      }
+
+      .card {
+        background: #ffffff;
+        border: 1px solid #e6e8ec;
+        border-radius: 14px;
+        overflow: hidden;
+      }
+
+      .header {
+        padding: 22px 22px 10px 22px;
+        text-align: center;
+        background: #ffffff;
+      }
+
+      img.logo {
+        max-width: 180px;
+        height: auto;
+        display: inline-block;
+      }
+
+      .content {
+        padding: 8px 22px 22px 22px;
+      }
+
+      h1, h2 {
+        margin: 0;
+        padding: 0;
+        color: #111827;
+        font-weight: 700;
+      }
+
+      h1 {
+        font-size: 22px;
+        line-height: 1.2;
+      }
+
+      p {
+        margin: 0;
+        padding: 0;
+        line-height: 1.6;
+        color: #374151;
+      }
+
+      .muted {
+        color: #6b7280;
+        font-size: 12px;
+      }
+
+      .btn {
+        display: inline-block;
+        text-decoration: none;
+        border-radius: 10px;
+        padding: 12px 18px;
+        font-weight: 700;
+        text-align: center;
+      }
+
+      /* TrackSanté-ish: deep matcha/green */
+      .btn-primary {
+      background-color: #2f6b4f;
+      color: #ffffff !important;
+      }
+
+      .btn-primary:hover {
+        opacity: 0.95;
+      }
+
+      .footer {
+        margin-top: 14px;
+        background: #ffffff;
+        border: 1px solid #e6e8ec;
+        border-radius: 14px;
+        padding: 14px 16px;
+      }
+
+      .footer a {
+        color: #2f6b4f;
+        text-decoration: underline;
+      }
+
+      /* Make links break nicely on mobile */
+      .break {
+        word-break: break-all;
+        overflow-wrap: break-word;
+      }
+    </style>
+  </head>
+
+  <body>
+    <div class="container">
+      <table width="100%" cellpadding="0" cellspacing="0" border="0">
+        <tr>
+          <td>
+            <div class="card">
+              <div class="header">
+                <img
+                  src="{% block logo_url %}https://tracksante.com/assets/tracksante-logo.png{% endblock %}"
+                  alt="TrackSanté"
+                  class="logo"
+                  width="180"
+                  style="max-width:180px;height:auto;display:inline-block;border:0;"
+                >
+              </div>
+
+              <div class="content">
+                <table width="100%" cellpadding="0" cellspacing="0" border="0">
+                  {% block content %}{% endblock %}
+                </table>
+              </div>
+            </div>
+
+            <div class="footer">
+              <table width="100%" cellpadding="0" cellspacing="0" border="0">
+                {% block sub_content %}{% endblock %}
+                <tr>
+                  <td align="center" class="muted" style="padding-top: 10px;">
+                    © {% now "Y" %} TrackSanté. If you didn’t request this, you can ignore this email.
+                  </td>
+                </tr>
+              </table>
+            </div>
+
+          </td>
+        </tr>
+      </table>
+    </div>
+  </body>
+</html>

@@ -1,0 +1,10 @@
+{% load i18n %}{% autoescape off %}{% translate "Welcome to TrackSanté!" %}
+
+{% translate "Please confirm your email address to finish creating your account." %}
+
+{{ url }}
+
+--
+TrackSanté
+https://tracksante.com
+{% endautoescape %}
