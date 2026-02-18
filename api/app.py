@@ -2,6 +2,7 @@
 import os, io, time, hashlib
 import base64, secrets
 import httpx
+import uuid
 from typing import Optional
 from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException, Query, Request, Depends, Response
@@ -13,8 +14,9 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 import boto3, psycopg
 from psycopg.types import json as psyjson  # (optional, handy if you use psyjson.Json)
+from psycopg.errors import UniqueViolation
 import json as _json
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urlsplit, urlunsplit, urlencode
 import jwt
 
 # --- create the app ONCE, before any @app.* decorators ---
@@ -83,6 +85,9 @@ ACCESS_TTL_SECONDS = int(os.getenv("ACCESS_TTL_SECONDS", "900"))        # 15 min
 REFRESH_TTL_SECONDS = int(os.getenv("REFRESH_TTL_SECONDS", "2592000"))  # 30 days
 
 AUTH_ENROLLMENT_FLOW_SLUG = os.getenv("AUTH_ENROLLMENT_FLOW_SLUG", "").strip()
+
+AUTH_REDIRECT_URI_WEB = os.getenv("AUTH_REDIRECT_URI_WEB", "https://api.tracksante.com/auth/oidc/callback")
+AUTH_REDIRECT_URI_MOBILE = os.getenv("AUTH_REDIRECT_URI_MOBILE", "https://tracksante.com/mobile/callback")
 
 REFRESH_COOKIE = "ts_refresh"
 
@@ -154,6 +159,10 @@ class ChatReq(BaseModel):
     message: str
     session_id: str | None = None
 
+class MobileExchangeReq(BaseModel):
+    code: str
+    code_verifier: str
+
 def auth_device(authorization: Optional[str], device_id: str):
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
@@ -194,16 +203,14 @@ async def _fetch_oidc_config(issuer: str):
         r.raise_for_status()
         return r.json()
 
-async def _exchange_code_for_tokens(token_endpoint: str, code: str, code_verifier: str):
+async def _exchange_code_for_tokens(token_endpoint: str, code: str, code_verifier: str, redirect_uri: str):
     data = {
         "grant_type": "authorization_code",
         "client_id": AUTH_CLIENT_ID,
         "code": code,
-        "redirect_uri": AUTH_REDIRECT_URI,
+        "redirect_uri": redirect_uri,
         "code_verifier": code_verifier,
     }
-
-    # If the provider is "confidential", include client_secret
     if AUTH_CLIENT_SECRET:
         data["client_secret"] = AUTH_CLIENT_SECRET
 
@@ -224,17 +231,96 @@ async def _userinfo(userinfo_endpoint: str, access_token: str):
 
 def upsert_user_from_oidc(issuer: str, sub: str, email: str | None, name: str | None) -> str:
     with db() as conn, conn.cursor() as cur:
+        # 1) First: if we already have this OIDC identity, update profile fields and return.
         cur.execute(
             """
-            INSERT INTO users (auth_issuer, auth_sub, email, name)
-            VALUES (%s, %s, %s, %s)
-            ON CONFLICT (auth_issuer, auth_sub)
-            DO UPDATE SET email=EXCLUDED.email, name=EXCLUDED.name
-            RETURNING id::text;
+            SELECT id::text
+            FROM users
+            WHERE auth_issuer = %s AND auth_sub = %s
             """,
-            (issuer, sub, email, name),
+            (issuer, sub),
         )
-        return cur.fetchone()[0]
+        row = cur.fetchone()
+        if row:
+            user_id = row[0]
+            cur.execute(
+                """
+                UPDATE users
+                SET email = COALESCE(%s, email),
+                    name  = COALESCE(%s, name)
+                WHERE id = %s
+                RETURNING id::text
+                """,
+                (email, name, user_id),
+            )
+            return cur.fetchone()[0]
+
+        # 2) If no (issuer, sub) match, try to link by email if present.
+        if email:
+            cur.execute(
+                """
+                SELECT id::text
+                FROM users
+                WHERE lower(email) = lower(%s)
+                """,
+                (email,),
+            )
+            row = cur.fetchone()
+            if row:
+                user_id = row[0]
+                # Link this existing user to this OIDC identity
+                cur.execute(
+                    """
+                    UPDATE users
+                    SET auth_issuer = %s,
+                        auth_sub    = %s,
+                        name        = COALESCE(%s, name),
+                        email       = COALESCE(%s, email)
+                    WHERE id = %s
+                    RETURNING id::text
+                    """,
+                    (issuer, sub, name, email, user_id),
+                )
+                return cur.fetchone()[0]
+
+        # 3) Otherwise insert fresh.
+        try:
+            cur.execute(
+                """
+                INSERT INTO users (auth_issuer, auth_sub, email, name)
+                VALUES (%s, %s, %s, %s)
+                RETURNING id::text
+                """,
+                (issuer, sub, email, name),
+            )
+            return cur.fetchone()[0]
+        except UniqueViolation:
+            # Very rare race / edge case: email became taken between our check and insert.
+            # Re-run the email-link path once.
+            conn.rollback()
+            if not email:
+                raise
+            with conn.cursor() as cur2:
+                cur2.execute(
+                    "SELECT id::text FROM users WHERE lower(email) = lower(%s)",
+                    (email,),
+                )
+                row = cur2.fetchone()
+                if not row:
+                    raise
+                user_id = row[0]
+                cur2.execute(
+                    """
+                    UPDATE users
+                    SET auth_issuer = %s,
+                        auth_sub    = %s,
+                        name        = COALESCE(%s, name)
+                    WHERE id = %s
+                    RETURNING id::text
+                    """,
+                    (issuer, sub, name, user_id),
+                )
+                return cur2.fetchone()[0]
 
 
 # ---------------- OIDC routes ----------------
@@ -250,27 +336,47 @@ async def auth_register():
 
 
 @app.get("/auth/login")
-async def auth_login():
+async def auth_login(
+    client: str = Query("web", pattern="^(web|mobile)$"),
+    next: str | None = None,
+
+    # ✅ allow mobile app to provide these
+    state: str | None = None,
+    code_challenge: str | None = None,
+    code_challenge_method: str = "S256",
+):
     if not AUTH_CLIENT_ID:
         raise HTTPException(500, "Missing AUTH_CLIENT_ID")
 
-    # 1) Fetch discovery from INTERNAL address (API container can reach this)
+    redirect_uri = AUTH_REDIRECT_URI_WEB if client == "web" else AUTH_REDIRECT_URI_MOBILE
+
     oidc = await _fetch_oidc_config(AUTH_INTERNAL_ISSUER)
     authorize_endpoint = oidc["authorization_endpoint"]
 
-    # 2) Rewrite authorize URL host for the BROWSER (browser must use localhost:9002)
-    pub = urlsplit(AUTH_PUBLIC_BASE)         # e.g. http://localhost:9002
-    auth = urlsplit(authorize_endpoint)      # e.g. http://authentik-server:9000/...
+    # rewrite to public base for browser
+    pub = urlsplit(AUTH_PUBLIC_BASE)
+    auth = urlsplit(authorize_endpoint)
+    authorize_endpoint = urlunsplit((pub.scheme, pub.netloc, auth.path, auth.query, auth.fragment))
 
-    authorize_endpoint = urlunsplit((
-        pub.scheme,      # http
-        pub.netloc,      # localhost:9002
-        auth.path,       # /application/o/track...
-        auth.query,
-        auth.fragment,
-    ))
+    if client == "mobile":
+        # ✅ MUST use the app-provided values
+        if not state or not code_challenge:
+            raise HTTPException(400, "Missing state or code_challenge for mobile login")
 
-    state = secrets.token_urlsafe(24)
+        url = (
+            f"{authorize_endpoint}"
+            f"?client_id={AUTH_CLIENT_ID}"
+            f"&response_type=code"
+            f"&redirect_uri={httpx.URL(redirect_uri)}"
+            f"&scope=openid%20email%20profile"
+            f"&state={state}"
+            f"&code_challenge={code_challenge}"
+            f"&code_challenge_method={code_challenge_method}"
+        )
+        return RedirectResponse(url=url, status_code=302)
+
+    # ---- web flow: backend generates state+pkce and uses cookies ----
+    web_state = secrets.token_urlsafe(24)
     verifier, challenge = _pkce_pair()
 
     resp = RedirectResponse(
@@ -278,43 +384,35 @@ async def auth_login():
             f"{authorize_endpoint}"
             f"?client_id={AUTH_CLIENT_ID}"
             f"&response_type=code"
-            f"&redirect_uri={httpx.URL(AUTH_REDIRECT_URI)}"
+            f"&redirect_uri={httpx.URL(redirect_uri)}"
             f"&scope=openid%20email%20profile"
-            f"&state={state}"
+            f"&state={web_state}"
             f"&code_challenge={challenge}"
             f"&code_challenge_method=S256"
         ),
         status_code=302,
     )
-    resp.set_cookie("oidc_state", state, httponly=True, samesite="lax")
-    resp.set_cookie("oidc_verifier", verifier, httponly=True, samesite="lax")
+
+    resp.set_cookie("oidc_state", web_state, httponly=True, samesite="none", secure=True)
+    resp.set_cookie("oidc_verifier", verifier, httponly=True, samesite="none", secure=True)
+    resp.set_cookie("oidc_client", "web", httponly=True, samesite="none", secure=True)
+    if next:
+        resp.set_cookie("oidc_next", next, httponly=True, samesite="none", secure=True)
+
     return resp
 
 
-@app.post("/auth/logout")
-async def auth_logout(response: Response):
-    # Clear refresh cookie
-    response.delete_cookie(
-        key=REFRESH_COOKIE,
-        path="/",
-        samesite="lax",     # keep consistent with how you set it
-        secure=True,       # localhost dev; set True on https
-    )
-    return {"ok": True}
-
-
-@app.get("/auth/oidc/callback")
-async def auth_oidc_callback(request: Request, code: str | None = None, state: str | None = None):
-    if not code or not state:
-        raise HTTPException(400, "Missing code or state")
-
-    cookie_state = request.cookies.get("oidc_state")
-    verifier = request.cookies.get("oidc_verifier")
-    if not cookie_state or not verifier or cookie_state != state:
-        raise HTTPException(400, "Invalid state")
+@app.post("/auth/mobile/exchange")
+async def auth_mobile_exchange(req: MobileExchangeReq):
 
     oidc = await _fetch_oidc_config(AUTH_INTERNAL_ISSUER)
-    tokens = await _exchange_code_for_tokens(oidc["token_endpoint"], code, verifier)
+
+    tokens = await _exchange_code_for_tokens(
+        oidc["token_endpoint"],
+        req.code,
+        req.code_verifier,
+        AUTH_REDIRECT_URI_MOBILE,
+    )
 
     access_token = tokens.get("access_token")
     if not access_token:
@@ -332,22 +430,91 @@ async def auth_oidc_callback(request: Request, code: str | None = None, state: s
     issuer = oidc["issuer"]
     user_id = upsert_user_from_oidc(issuer=issuer, sub=sub, email=email, name=name)
 
-    # Create refresh token (stored in HttpOnly cookie)
+    # your own app tokens
+    refresh_jwt = make_refresh_token(user_id)
+    access_jwt = make_access_token(user_id)
+
+    # Return JSON to the app (store refresh securely in flutter)
+    return {
+        "user_id": user_id,
+        "access_token": access_jwt,
+        "refresh_token": refresh_jwt,
+    }
+
+
+@app.post("/auth/logout")
+async def auth_logout(response: Response):
+    # Clear refresh cookie
+    response.delete_cookie(
+        key=REFRESH_COOKIE,
+        path="/",
+        samesite="none",     # keep consistent with how you set it
+        secure=True,       # localhost dev; set True on https
+    )
+    return {"ok": True}
+
+
+@app.get("/auth/oidc/callback")
+async def auth_oidc_callback(request: Request, code: str | None = None, state: str | None = None):
+    if not code or not state:
+        raise HTTPException(400, "Missing code or state")
+
+    cookie_state = request.cookies.get("oidc_state")
+    verifier = request.cookies.get("oidc_verifier")
+    if not cookie_state or not verifier or cookie_state != state:
+        raise HTTPException(400, "Invalid state")
+
+    oidc = await _fetch_oidc_config(AUTH_INTERNAL_ISSUER)
+
+    client_kind = request.cookies.get("oidc_client", "web")
+    redirect_uri = AUTH_REDIRECT_URI_WEB if client_kind == "web" else AUTH_REDIRECT_URI_MOBILE
+
+    tokens = await _exchange_code_for_tokens(oidc["token_endpoint"], code, verifier, redirect_uri)
+
+    access_token = tokens.get("access_token")
+    if not access_token:
+        raise HTTPException(400, "No access_token returned")
+
+    info = await _userinfo(oidc["userinfo_endpoint"], access_token)
+    sub = info.get("sub")
+    if not sub:
+        raise HTTPException(400, "No sub in userinfo")
+
+    email = info.get("email")
+    name = info.get("name") or info.get("preferred_username")
+
+    issuer = oidc["issuer"]
+    user_id = upsert_user_from_oidc(issuer=issuer, sub=sub, email=email, name=name)
+
+    # set refresh cookie for api.tracksante.com
     refresh_jwt = make_refresh_token(user_id)
 
-    resp = RedirectResponse(url=AUTH_SUCCESS_REDIRECT, status_code=302)
+    # decide where to send the browser next
+    if client_kind == "mobile":
+        # redirect to the App Link page so Android opens the app
+        # (pass code/state through so the app can finish login if you want)
+        next_url = f"https://tracksante.com/mobile/callback?{urlencode({'code': code, 'state': state})}"
+    else:
+        # optional "next" support
+        next_url = request.cookies.get("oidc_next") or AUTH_SUCCESS_REDIRECT
+
+    resp = RedirectResponse(url=next_url, status_code=302)
 
     resp.set_cookie(
         key=REFRESH_COOKIE,
         value=refresh_jwt,
         httponly=True,
-        samesite="lax",
-        secure=True,  # set True when behind HTTPS in production
+        samesite="none",
+        secure=True,
         path="/",
     )
 
+    # cleanup
     resp.delete_cookie("oidc_state")
     resp.delete_cookie("oidc_verifier")
+    resp.delete_cookie("oidc_client")
+    resp.delete_cookie("oidc_next")
+
     return resp
 
 @app.post("/auth/refresh")
@@ -639,9 +806,122 @@ async def chat(req: ChatReq, authorization: str | None = Header(None)):
     # optional: reuse your API_KEYS auth (or leave open for now)
     # auth_device(authorization, "kit-001")
     from rag_conv.rag_agent import chat_once
-    return await run_in_threadpool(
+
+    try:
+        uuid.UUID(req.user_id)
+    except ValueError:
+        raise HTTPException(400, "user_id must be a valid UUID from users.id")
+
+    session_id = req.session_id
+    with db() as conn, conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM users WHERE id=%s LIMIT 1;", (req.user_id,))
+        if not cur.fetchone():
+            raise HTTPException(404, "User not found")
+
+        # Validate/create DB-backed session so chat rows always link to a user.
+        if session_id:
+            try:
+                uuid.UUID(session_id)
+            except ValueError:
+                # Backward compatibility: older clients may send timestamp-style session IDs.
+                # Treat those as "no session" and create a fresh DB-backed UUID session.
+                session_id = None
+
+            if session_id:
+                cur.execute(
+                    "SELECT 1 FROM user_sessions WHERE id=%s AND user_id=%s LIMIT 1;",
+                    (session_id, req.user_id),
+                )
+                if not cur.fetchone():
+                    raise HTTPException(400, "Invalid session_id for this user")
+        else:
+            cur.execute(
+                """
+                INSERT INTO user_sessions (user_id, started_at, meta)
+                VALUES (%s, now(), %s::jsonb)
+                RETURNING id::text;
+                """,
+                (req.user_id, _json.dumps({"source": "api_chat"})),
+            )
+            (session_id,) = cur.fetchone()
+
+    chat_result = await run_in_threadpool(
         chat_once,
         user_id=req.user_id,
         user_message=req.message,
-        session_id=req.session_id
+        session_id=session_id
     )
+
+    assistant_message = chat_result.get("assistant_message")
+    if not isinstance(assistant_message, str):
+        assistant_message = _json.dumps(chat_result, ensure_ascii=False)
+
+    with db() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO session_messages (session_id, role, content, meta)
+            VALUES (%s, 'user', %s, %s::jsonb)
+            """,
+            (session_id, req.message, _json.dumps({})),
+        )
+        cur.execute(
+            """
+            INSERT INTO session_messages (session_id, role, content, meta)
+            VALUES (%s, 'assistant', %s, %s::jsonb)
+            """,
+            (session_id, assistant_message, _json.dumps(chat_result)),
+        )
+
+        recommended_sensor = chat_result.get("recommended_sensor")
+        suggested_next_step = chat_result.get("suggested_next_step")
+        recommended_measurements = chat_result.get("recommended_measurements")
+        if not isinstance(recommended_measurements, list):
+            recommended_measurements = []
+        sensor_confidence = chat_result.get("sensor_confidence")
+        is_actionable_sensor = (
+            recommended_sensor in {
+                "Humidity Sensor",
+                "CO2 Sensor",
+                "Temperature Sensor",
+                "Heart Rate Sensor",
+                "Blood Oxygen Sensor",
+                # Backward compatibility for older prompt/output naming.
+                "Pulse Oxygen Sensor",
+            }
+            and suggested_next_step == "proceed_to_measurements"
+        )
+
+        session_signal = {
+            "last_recommended_sensor": recommended_sensor,
+            "last_suggested_next_step": suggested_next_step,
+            "last_recommended_measurements": recommended_measurements,
+            "last_sensor_confidence": sensor_confidence,
+            "last_is_actionable_sensor": is_actionable_sensor,
+            "last_assistant_message": assistant_message,
+            "last_chat_at": _utcnow().isoformat(),
+        }
+        cur.execute(
+            """
+            UPDATE user_sessions
+            SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb
+            WHERE id = %s AND user_id = %s
+            """,
+            (_json.dumps(session_signal), session_id, req.user_id),
+        )
+
+        collected_facts = chat_result.get("collected_facts")
+        if isinstance(collected_facts, dict) and collected_facts:
+            cur.execute(
+                """
+                INSERT INTO user_memory (user_id, memory, updated_at)
+                VALUES (%s, %s::jsonb, now())
+                ON CONFLICT (user_id)
+                DO UPDATE SET
+                  memory = user_memory.memory || EXCLUDED.memory,
+                  updated_at = now();
+                """,
+                (req.user_id, _json.dumps(collected_facts)),
+            )
+
+    chat_result["session_id"] = session_id
+    return chat_result

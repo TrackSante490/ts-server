@@ -42,6 +42,8 @@ services:
         condition: service_started
       ollama:
         condition: service_started
+      ollama-init:
+        condition: service_completed_successfully
 
   migrate:
     image: postgres:16
@@ -62,6 +64,35 @@ services:
       - ollama-data:/root/.ollama
       # We do NOT expose 11434 publicly here.
       # api talks to it internally via http://ollama:11434
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  ollama-init:
+    image: ollama/ollama:latest
+    restart: "no"
+    depends_on:
+      - ollama
+    env_file:
+      - .env
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    entrypoint: ["/bin/sh", "-lc"]
+    command: |
+      set -e
+      until ollama list >/dev/null 2>&1; do
+        echo "waiting for ollama..."; sleep 1
+      done
+      ollama pull ${OLLAMA_CHAT_MODEL} || true
+      ollama pull ${OLLAMA_EMBED_MODEL} || true
+      exit 0
 
   db:
     image: postgres:16
@@ -189,5 +220,13 @@ services:
       - ./authentik-branding/custom.css:/web/dist/custom.css:ro
       - ./blank.png:/web/dist/assets/icons/icon_left_brand.png:ro
     
+  tracksante-site:
+    image: nginx:alpine
+    restart: unless-stopped
+    volumes:
+      - /srv/tracksante-site:/usr/share/nginx/html:ro
+    ports:
+      - "8088:80"
+
 volumes:
   ollama-data:
