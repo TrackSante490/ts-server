@@ -67,6 +67,10 @@ services:
     environment:
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      # Keep models resident to avoid repeated cold-load latency.
+      OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:-24h}
+      # Allow both chat + embedding models to remain loaded on the same GPU.
+      OLLAMA_MAX_LOADED_MODELS: ${OLLAMA_MAX_LOADED_MODELS:-2}
     deploy:
       resources:
         reservations:
@@ -227,6 +231,15 @@ services:
       - /srv/tracksante-site:/usr/share/nginx/html:ro
     ports:
       - "8088:80"
+
+  tracksante-app:
+    image: nginx:alpine
+    restart: unless-stopped
+    volumes:
+      - /srv/tracksante-app:/usr/share/nginx/html:ro
+      - ./nginx/tracksante-app.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - "8089:80"
 
 volumes:
   ollama-data:

@@ -3,7 +3,7 @@ import os, io, time, hashlib
 import base64, secrets
 import httpx
 import uuid
-from typing import Optional
+from typing import Optional, Any
 from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException, Query, Request, Depends, Response
 from fastapi.concurrency import run_in_threadpool
@@ -90,6 +90,7 @@ AUTH_REDIRECT_URI_WEB = os.getenv("AUTH_REDIRECT_URI_WEB", "https://api.tracksan
 AUTH_REDIRECT_URI_MOBILE = os.getenv("AUTH_REDIRECT_URI_MOBILE", "https://tracksante.com/mobile/callback")
 
 REFRESH_COOKIE = "ts_refresh"
+PROFILE_FILE_MAX_MB = int(os.getenv("PROFILE_FILE_MAX_MB", "20"))
 
 
 app.mount("/assets", StaticFiles(directory="/app/assets"), name="assets")
@@ -162,6 +163,21 @@ class ChatReq(BaseModel):
 class MobileExchangeReq(BaseModel):
     code: str
     code_verifier: str
+
+class UserProfileUpdateReq(BaseModel):
+    first_name: str | None = None
+    last_name: str | None = None
+    sex: str | None = None
+    age: int | None = Field(default=None, ge=0, le=130)
+    weight_kg: float | None = Field(default=None, gt=0, le=500)
+    height_cm: float | None = Field(default=None, gt=0, le=300)
+    medical_history: str | None = None
+    medical_history_file_key: str | None = None
+
+class UserProfileResp(BaseModel):
+    user_id: str
+    profile: dict[str, Any] = Field(default_factory=dict)
+    updated_at: datetime | None = None
 
 def auth_device(authorization: Optional[str], device_id: str):
     if not authorization or not authorization.startswith("Bearer "):
@@ -544,8 +560,7 @@ def auth_refresh(request: Request):
 
 bearer = HTTPBearer(auto_error=False)
 
-@app.get("/auth/me")
-def auth_me(creds: HTTPAuthorizationCredentials = Depends(bearer)):
+def require_access_user_id(creds: HTTPAuthorizationCredentials = Depends(bearer)) -> str:
     if not creds:
         raise HTTPException(401, "Missing bearer token")
 
@@ -563,7 +578,11 @@ def auth_me(creds: HTTPAuthorizationCredentials = Depends(bearer)):
     if payload.get("typ") != "access":
         raise HTTPException(401, "Wrong token type")
 
-    return {"user_id": payload["sub"]}
+    return payload["sub"]
+
+@app.get("/auth/me")
+def auth_me(user_id: str = Depends(require_access_user_id)):
+    return {"user_id": user_id}
 
 
 # --------- routes ----------
@@ -581,6 +600,51 @@ def create_user():
         cur.execute("INSERT INTO users DEFAULT VALUES RETURNING id::text;")
         (user_id,) = cur.fetchone()
     return {"user_id": user_id}
+
+@app.get("/api/profile", response_model=UserProfileResp)
+def get_profile(user_id: str = Depends(require_access_user_id)):
+    with db() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT profile, updated_at
+            FROM user_profile
+            WHERE user_id = %s
+            """,
+            (user_id,),
+        )
+        row = cur.fetchone()
+
+    if not row:
+        return {"user_id": user_id, "profile": {}, "updated_at": None}
+
+    return {"user_id": user_id, "profile": row[0] or {}, "updated_at": row[1]}
+
+@app.patch("/api/profile", response_model=UserProfileResp)
+def update_profile(req: UserProfileUpdateReq, user_id: str = Depends(require_access_user_id)):
+    patch = req.model_dump(exclude_unset=True)
+    if not patch:
+        return get_profile(user_id)
+
+    with db() as conn, conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM users WHERE id=%s LIMIT 1;", (user_id,))
+        if not cur.fetchone():
+            raise HTTPException(404, "User not found")
+
+        cur.execute(
+            """
+            INSERT INTO user_profile (user_id, profile, updated_at)
+            VALUES (%s, %s::jsonb, now())
+            ON CONFLICT (user_id)
+            DO UPDATE SET
+              profile = COALESCE(user_profile.profile, '{}'::jsonb) || EXCLUDED.profile,
+              updated_at = now()
+            RETURNING profile, updated_at
+            """,
+            (user_id, _json.dumps(patch)),
+        )
+        profile, updated_at = cur.fetchone()
+
+    return {"user_id": user_id, "profile": profile or {}, "updated_at": updated_at}
 
 @app.post("/api/devices/register", response_model=DeviceRegisterResp)
 def register_device(req: DeviceRegisterReq):
@@ -700,6 +764,15 @@ class ImgRow(BaseModel):
     width: int | None = None
     height: int | None = None
 
+class ProfileFileUploadResp(BaseModel):
+    id: str
+    session_id: str | None = None
+    key: str
+    mime: str
+    size_bytes: int
+    sha256: str
+    ts: str
+
 @app.post("/api/images/upload")
 async def upload_image(
     file: UploadFile = File(...),
@@ -747,6 +820,82 @@ async def upload_image(
         img_id, ts = cur.fetchone()
 
     return {"id": img_id, "device_id": device_id, "session_id": session_id, "key": key, "ts": ts.isoformat()}
+
+@app.post("/api/files/upload", response_model=ProfileFileUploadResp)
+async def upload_profile_file(
+    file: UploadFile = File(...),
+    session_id: str | None = Form(None),
+    user_id: str = Depends(require_access_user_id),
+):
+    data = await file.read()
+    if not data:
+        raise HTTPException(400, "Empty file")
+
+    max_bytes = PROFILE_FILE_MAX_MB * 1024 * 1024
+    if len(data) > max_bytes:
+        raise HTTPException(413, f"File too large (max {PROFILE_FILE_MAX_MB} MB)")
+
+    # Profile history uploads are intentionally strict: PDF only.
+    ext = os.path.splitext(file.filename or "")[-1].lower()
+    mime = (file.content_type or "").lower()
+    is_pdf = ext == ".pdf" or mime == "application/pdf"
+    if not is_pdf:
+        raise HTTPException(415, "Only PDF files are allowed")
+
+    safe_name = os.path.basename(file.filename or "history.pdf")
+    if not safe_name.lower().endswith(".pdf"):
+        safe_name = f"{safe_name}.pdf"
+
+    if session_id:
+        try:
+            uuid.UUID(session_id)
+        except ValueError:
+            raise HTTPException(400, "session_id must be a UUID")
+
+    with db() as conn, conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM users WHERE id=%s LIMIT 1;", (user_id,))
+        if not cur.fetchone():
+            raise HTTPException(404, "User not found")
+
+        if session_id:
+            cur.execute(
+                "SELECT 1 FROM user_sessions WHERE id=%s AND user_id=%s LIMIT 1;",
+                (session_id, user_id),
+            )
+            if not cur.fetchone():
+                raise HTTPException(400, "Invalid session_id for this user")
+
+    sha = hashlib.sha256(data).hexdigest()
+    day = time.strftime("%Y/%m/%d")
+    key = f"profiles/{user_id}/{day}/{sha}-{safe_name}"
+
+    S3.put_object(
+        Bucket=BKT,
+        Key=key,
+        Body=data,
+        ContentType="application/pdf",
+    )
+
+    with db() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO images(session_id, device_id, bucket, key, sha256, mime, width, height)
+            VALUES (%s, NULL, %s, %s, %s, %s, NULL, NULL)
+            RETURNING id::text, ts;
+            """,
+            (session_id, BKT, key, sha, "application/pdf"),
+        )
+        file_id, ts = cur.fetchone()
+
+    return {
+        "id": file_id,
+        "session_id": session_id,
+        "key": key,
+        "mime": "application/pdf",
+        "size_bytes": len(data),
+        "sha256": sha,
+        "ts": ts.isoformat(),
+    }
 
 
 @app.get("/api/images/list", response_model=list[ImgRow])
