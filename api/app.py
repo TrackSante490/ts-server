@@ -147,6 +147,10 @@ class StartSessionResp(BaseModel):
     session_id: str
     device_id: str
 
+class EndSessionReq(BaseModel):
+    session_id: str
+    ended_at: datetime | None = None
+
 class SensorEventReq(BaseModel):
     device_external_id: str
     session_id: str | None = None
@@ -702,6 +706,54 @@ def start_session(req: StartSessionReq):
         (session_id,) = cur.fetchone()
 
     return {"session_id": session_id, "device_id": device_id}
+
+@app.post("/api/sessions/end")
+def end_session(req: EndSessionReq):
+    end_ts = req.ended_at or datetime.now(timezone.utc)
+
+    with db() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT started_at, ended_at
+            FROM user_sessions
+            WHERE id=%s
+            """,
+            (req.session_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, "Session not found")
+
+        started_at, existing_ended_at = row
+
+        if existing_ended_at is not None:
+            return {
+                "ok": True,
+                "session_id": req.session_id,
+                "ended_at": existing_ended_at.isoformat(),
+                "already_ended": True,
+            }
+
+        if end_ts < started_at:
+            raise HTTPException(400, "ended_at cannot be before started_at")
+
+        cur.execute(
+            """
+            UPDATE user_sessions
+            SET ended_at = %s
+            WHERE id=%s
+            RETURNING ended_at
+            """,
+            (end_ts, req.session_id),
+        )
+        (stored_ended_at,) = cur.fetchone()
+
+    return {
+        "ok": True,
+        "session_id": req.session_id,
+        "ended_at": stored_ended_at.isoformat(),
+        "already_ended": False,
+    }
 
 @app.post("/api/sensors/events")
 def sensor_event(req: SensorEventReq):
