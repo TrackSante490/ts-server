@@ -1,6 +1,8 @@
 # --- keep imports at top ---
 import os, io, time, hashlib
-import base64, secrets
+import secrets
+import logging
+import base64
 import httpx
 import uuid
 from typing import Optional, Any
@@ -18,6 +20,11 @@ from psycopg.errors import UniqueViolation
 import json as _json
 from urllib.parse import urlsplit, urlunsplit, urlencode
 import jwt
+
+# ---- logging ----
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=LOG_LEVEL)
+logger = logging.getLogger("tracksante.api")
 
 # --- create the app ONCE, before any @app.* decorators ---
 app = FastAPI()
@@ -80,6 +87,8 @@ DBURL = DATABASE_URL
 JWT_SECRET = os.getenv("JWT_SECRET", "dev-change-me")
 JWT_ISSUER = os.getenv("JWT_ISSUER", "tracksante-api")
 JWT_AUDIENCE = os.getenv("JWT_AUDIENCE", "tracksante")
+REPORT_MODEL_DEFAULT = os.getenv("REPORT_MODEL", os.getenv("OLLAMA_CHAT_MODEL", "llama3.1"))
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
 
 ACCESS_TTL_SECONDS = int(os.getenv("ACCESS_TTL_SECONDS", "900"))        # 15 min
 REFRESH_TTL_SECONDS = int(os.getenv("REFRESH_TTL_SECONDS", "2592000"))  # 30 days
@@ -97,6 +106,350 @@ app.mount("/assets", StaticFiles(directory="/app/assets"), name="assets")
 
 def _utcnow():
     return datetime.now(timezone.utc)
+
+def _iso(dt: datetime | None) -> str | None:
+    return dt.isoformat() if dt else None
+
+def build_report_payload(user_id: str, limit_sessions: int, limit_events: int) -> dict[str, Any]:
+    # Build a compact payload for report generation.
+    with db() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id::text, email, name, created_at
+            FROM users
+            WHERE id = %s
+            """,
+            (user_id,),
+        )
+        user_row = cur.fetchone()
+        if not user_row:
+            raise HTTPException(404, "User not found")
+
+        cur.execute(
+            """
+            SELECT profile, updated_at
+            FROM user_profile
+            WHERE user_id = %s
+            """,
+            (user_id,),
+        )
+        profile_row = cur.fetchone()
+        profile = profile_row[0] if profile_row else {}
+        profile_updated_at = profile_row[1] if profile_row else None
+
+        profile_data: dict[str, Any] = profile if isinstance(profile, dict) else {}
+        nested_profile = profile_data.get("profile") if isinstance(profile_data, dict) else None
+        if isinstance(nested_profile, dict):
+            # Some clients may nest fields under "profile"; flatten with nested taking precedence.
+            profile_data = {**profile_data, **nested_profile}
+
+        first_name = None
+        last_name = None
+        if isinstance(profile_data, dict):
+            first_name = profile_data.get("first_name")
+            last_name = profile_data.get("last_name")
+        full_name = " ".join([p for p in [first_name, last_name] if p]) or (user_row[2] or None)
+
+        def _coalesce(*vals):
+            for v in vals:
+                if v is None:
+                    continue
+                if isinstance(v, str) and not v.strip():
+                    continue
+                if isinstance(v, list) and len(v) == 0:
+                    continue
+                if isinstance(v, dict) and len(v) == 0:
+                    continue
+                return v
+            return None
+
+        def _as_number(v):
+            if v is None:
+                return None
+            if isinstance(v, (int, float)):
+                return v
+            if isinstance(v, str):
+                try:
+                    return float(v)
+                except ValueError:
+                    return None
+            return None
+
+        def _extract_from_data(data: dict, keys: list[str]):
+            if not isinstance(data, dict):
+                return None
+            for k in keys:
+                if k in data:
+                    n = _as_number(data.get(k))
+                    if n is not None:
+                        return n
+            return None
+
+        def _latest_measurement(events: list[dict], kinds: set[str], keys: list[str]):
+            for ev in events:
+                if ev.get("kind") in kinds:
+                    n = _extract_from_data(ev.get("data") or {}, keys)
+                    if n is not None:
+                        return n
+                n = _extract_from_data(ev.get("data") or {}, keys)
+                if n is not None:
+                    return n
+            return None
+
+        def _latest_bp(events: list[dict]):
+            for ev in events:
+                data = ev.get("data") or {}
+                if not isinstance(data, dict):
+                    continue
+                if "bp" in data and isinstance(data.get("bp"), str):
+                    return data.get("bp")
+                sys = _extract_from_data(data, ["systolic", "sys", "bp_systolic"])
+                dia = _extract_from_data(data, ["diastolic", "dia", "bp_diastolic"])
+                if sys is not None and dia is not None:
+                    return f"{int(sys)}/{int(dia)}"
+            return None
+
+        patient_info = {
+            "user_id": user_row[0],
+            "email": user_row[1],
+            "full_name": full_name,
+            "first_name": first_name,
+            "last_name": last_name,
+            "sex": profile_data.get("sex") if isinstance(profile_data, dict) else None,
+            "age": profile_data.get("age") if isinstance(profile_data, dict) else None,
+            "weight_kg": profile_data.get("weight_kg") if isinstance(profile_data, dict) else None,
+            "height_cm": profile_data.get("height_cm") if isinstance(profile_data, dict) else None,
+            "medical_history": profile_data.get("medical_history") if isinstance(profile_data, dict) else None,
+            "medical_history_file_key": profile_data.get("medical_history_file_key") if isinstance(profile_data, dict) else None,
+        }
+
+        cur.execute(
+            """
+            SELECT memory, updated_at
+            FROM user_memory
+            WHERE user_id = %s
+            """,
+            (user_id,),
+        )
+        memory_row = cur.fetchone()
+        memory = memory_row[0] if memory_row else {}
+        memory_updated_at = memory_row[1] if memory_row else None
+
+        cur.execute(
+            """
+            SELECT id::text, started_at, ended_at, meta
+            FROM user_sessions
+            WHERE user_id = %s
+            ORDER BY started_at DESC
+            LIMIT %s
+            """,
+            (user_id, limit_sessions),
+        )
+        sessions = [
+            {
+                "id": r[0],
+                "started_at": _iso(r[1]),
+                "ended_at": _iso(r[2]),
+                "meta": r[3] or {},
+            }
+            for r in cur.fetchall()
+        ]
+
+        sensor_events: list[dict] = []
+        if limit_events > 0:
+            cur.execute(
+                """
+                SELECT se.id,
+                       se.session_id::text,
+                       se.device_id::text,
+                       se.ts,
+                       se.kind,
+                       se.seq,
+                       se.data
+                FROM sensor_events se
+                JOIN user_sessions us ON us.id = se.session_id
+                WHERE us.user_id = %s
+                ORDER BY se.ts DESC
+                LIMIT %s
+                """,
+                (user_id, limit_events),
+            )
+            sensor_events = [
+                {
+                    "id": r[0],
+                    "session_id": r[1],
+                    "device_id": r[2],
+                    "ts": _iso(r[3]),
+                    "kind": r[4],
+                    "seq": r[5],
+                    "data": r[6] or {},
+                }
+                for r in cur.fetchall()
+            ]
+
+        sensor_vitals = {}
+        sensor_summary = {}
+        if sensor_events:
+            def _collect_values(kinds: set[str], keys: list[str]):
+                vals = []
+                for ev in sensor_events:
+                    if ev.get("kind") in kinds:
+                        n = _extract_from_data(ev.get("data") or {}, keys)
+                        if n is not None:
+                            vals.append(n)
+                        continue
+                    n = _extract_from_data(ev.get("data") or {}, keys)
+                    if n is not None:
+                        vals.append(n)
+                return vals
+
+            def _range(vals: list[float], min_allowed: float | None = None, max_allowed: float | None = None):
+                cleaned = []
+                for v in vals:
+                    if v is None:
+                        continue
+                    if min_allowed is not None and v < min_allowed:
+                        continue
+                    if max_allowed is not None and v > max_allowed:
+                        continue
+                    cleaned.append(v)
+                if not cleaned:
+                    return None
+                return {"min": min(cleaned), "max": max(cleaned)}
+
+            hr = _latest_measurement(
+                sensor_events,
+                {"hr", "heart_rate", "pulse"},
+                ["hr", "heart_rate", "pulse", "bpm", "value"],
+            )
+            spo2 = _latest_measurement(
+                sensor_events,
+                {"spo2", "pulse_ox", "pulse_oxygen", "oxygen"},
+                ["spo2", "oxygen_saturation", "oxygen", "o2", "value"],
+            )
+            temp = _latest_measurement(
+                sensor_events,
+                {"temp", "temperature", "body_temp"},
+                ["temp", "temperature", "celsius", "value"],
+            )
+            rr = _latest_measurement(
+                sensor_events,
+                {"rr", "resp_rate", "respiratory_rate"},
+                ["rr", "resp_rate", "respiratory_rate", "value"],
+            )
+            bp = _latest_bp(sensor_events)
+            if hr is not None:
+                sensor_vitals["hr"] = hr
+            if spo2 is not None:
+                sensor_vitals["spo2"] = spo2
+            if temp is not None:
+                sensor_vitals["temp"] = temp
+            if rr is not None:
+                sensor_vitals["rr"] = rr
+            if bp is not None:
+                sensor_vitals["bp"] = bp
+
+            hr_vals = _collect_values({"hr", "heart_rate", "pulse"}, ["hr", "heart_rate", "pulse", "bpm", "value"])
+            spo2_vals = _collect_values({"spo2", "pulse_ox", "pulse_oxygen", "oxygen"}, ["spo2", "oxygen_saturation", "oxygen", "o2", "value"])
+            temp_vals = _collect_values({"temp", "temperature", "body_temp"}, ["temp", "temperature", "celsius", "value"])
+            rr_vals = _collect_values({"rr", "resp_rate", "respiratory_rate"}, ["rr", "resp_rate", "respiratory_rate", "value"])
+
+            hr_range = _range(hr_vals, min_allowed=1)
+            spo2_range = _range(spo2_vals, min_allowed=1, max_allowed=100)
+            temp_range = _range(temp_vals, min_allowed=1)
+            rr_range = _range(rr_vals, min_allowed=1)
+
+            if hr_range:
+                sensor_summary["hr"] = hr_range
+            if spo2_range:
+                sensor_summary["spo2"] = spo2_range
+            if temp_range:
+                sensor_summary["temp"] = temp_range
+            if rr_range:
+                sensor_summary["rr"] = rr_range
+
+        # Attachments (images) for report context
+        cur.execute(
+            """
+            SELECT i.key, i.ts
+            FROM images i
+            JOIN user_sessions us ON us.id = i.session_id
+            WHERE us.user_id = %s
+            ORDER BY i.ts DESC
+            LIMIT 20
+            """,
+            (user_id,),
+        )
+        attachments = [r[0] for r in cur.fetchall()]
+
+        # Top-level keys expected by report_gen templates
+        name = _coalesce(
+            patient_info.get("full_name"),
+            patient_info.get("first_name"),
+            user_row[2],
+        )
+        age = _coalesce(patient_info.get("age"), memory.get("age") if isinstance(memory, dict) else None)
+        sex = _coalesce(patient_info.get("sex"), memory.get("sex") if isinstance(memory, dict) else None)
+        allergies = _coalesce(
+            profile_data.get("allergies") if isinstance(profile_data, dict) else None,
+            memory.get("allergies") if isinstance(memory, dict) else None,
+        )
+        medications = _coalesce(
+            profile_data.get("medications") if isinstance(profile_data, dict) else None,
+            memory.get("medications") if isinstance(memory, dict) else None,
+        )
+        chief_complaint = _coalesce(
+            profile_data.get("chief_complaint") if isinstance(profile_data, dict) else None,
+            memory.get("chief_complaint") if isinstance(memory, dict) else None,
+        )
+        history_of_present_illness = _coalesce(
+            profile_data.get("history_of_present_illness") if isinstance(profile_data, dict) else None,
+            memory.get("history_of_present_illness") if isinstance(memory, dict) else None,
+            memory.get("hpi") if isinstance(memory, dict) else None,
+        )
+        past_medical_history = _coalesce(
+            profile_data.get("past_medical_history") if isinstance(profile_data, dict) else None,
+            memory.get("past_medical_history") if isinstance(memory, dict) else None,
+            profile_data.get("medical_history") if isinstance(profile_data, dict) else None,
+            memory.get("medical_history") if isinstance(memory, dict) else None,
+        )
+        family_history = _coalesce(
+            profile_data.get("family_history") if isinstance(profile_data, dict) else None,
+            memory.get("family_history") if isinstance(memory, dict) else None,
+        )
+        social_history = _coalesce(
+            profile_data.get("social_history") if isinstance(profile_data, dict) else None,
+            memory.get("social_history") if isinstance(memory, dict) else None,
+        )
+        vitals = _coalesce(
+            profile_data.get("vitals") if isinstance(profile_data, dict) else None,
+            memory.get("vitals") if isinstance(memory, dict) else None,
+            sensor_vitals,
+        )
+        exam = _coalesce(
+            profile_data.get("exam") if isinstance(profile_data, dict) else None,
+            memory.get("exam") if isinstance(memory, dict) else None,
+        )
+
+    return {
+        # Only include the keys the report generator expects to reduce prompt noise.
+        "patient_id": user_row[0],
+        "name": name,
+        "age": age,
+        "sex": sex,
+        "allergies": allergies,
+        "medications": medications,
+        "chief_complaint": chief_complaint,
+        "history_of_present_illness": history_of_present_illness,
+        "past_medical_history": past_medical_history,
+        "family_history": family_history,
+        "social_history": social_history,
+        "vitals": vitals,
+        "exam": exam,
+        "attachments": attachments,
+        # Optional extra context (compact)
+        "sensor_summary": sensor_summary,
+    }
 
 def make_access_token(user_id: str) -> str:
     now = _utcnow()
@@ -182,6 +535,23 @@ class UserProfileResp(BaseModel):
     user_id: str
     profile: dict[str, Any] = Field(default_factory=dict)
     updated_at: datetime | None = None
+
+class ReportGenerateReq(BaseModel):
+    limit_sessions: int = Field(default=5, ge=1, le=50)
+    limit_events: int = Field(default=200, ge=0, le=2000)
+
+class ReportRunReq(ReportGenerateReq):
+    model: str | None = None
+
+class ReportListItem(BaseModel):
+    report_id: str
+    created_at: datetime
+    model: str
+    status: str
+    payload_hash: str | None = None
+
+class ReportDetail(ReportListItem):
+    report_md: str
 
 def auth_device(authorization: Optional[str], device_id: str):
     if not authorization or not authorization.startswith("Bearer "):
@@ -594,6 +964,16 @@ def auth_me(user_id: str = Depends(require_access_user_id)):
 def health():
     return {"ok": True, "time": time.time()}
 
+@app.get("/api/health/db")
+def health_db():
+    try:
+        with db() as conn, conn.cursor() as cur:
+            cur.execute("SELECT 1;")
+        return {"ok": True}
+    except Exception:
+        logger.exception("health_db failed")
+        raise HTTPException(500, {"code": "DB_UNREACHABLE", "message": "Database unreachable"})
+
 @app.get("/callback")
 async def callback(request: Request):
     return {"query": dict(request.query_params)}
@@ -649,6 +1029,133 @@ def update_profile(req: UserProfileUpdateReq, user_id: str = Depends(require_acc
         profile, updated_at = cur.fetchone()
 
     return {"user_id": user_id, "profile": profile or {}, "updated_at": updated_at}
+
+@app.post("/api/reports/generate")
+def generate_report(
+    req: ReportGenerateReq,
+    user_id: str = Depends(require_access_user_id),
+):
+    payload = build_report_payload(
+        user_id=user_id,
+        limit_sessions=req.limit_sessions,
+        limit_events=req.limit_events,
+    )
+    payload_json = _json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    payload_hash = hashlib.sha256(payload_json).hexdigest()
+    return {
+        "user_id": user_id,
+        "generated_at": _utcnow().isoformat(),
+        "payload_hash": payload_hash,
+        "payload": payload,
+    }
+
+@app.post("/api/reports/run")
+async def run_report(
+    req: ReportRunReq,
+    user_id: str = Depends(require_access_user_id),
+):
+    payload = build_report_payload(
+        user_id=user_id,
+        limit_sessions=req.limit_sessions,
+        limit_events=req.limit_events,
+    )
+    model_name = req.model or REPORT_MODEL_DEFAULT
+
+    def _run_llm(data: dict, model: str) -> str:
+        from langchain_ollama import ChatOllama
+        from report_gen.ollama import generate_report as _generate_report
+
+        chat_model = ChatOllama(model=model, temperature=0, base_url=OLLAMA_BASE_URL)
+        return _generate_report(data, chat_model)
+
+    try:
+        report_md = await run_in_threadpool(_run_llm, payload, model_name)
+    except Exception as e:
+        logger.exception("report generation failed")
+        raise HTTPException(502, f"Report generation failed: {e}")
+
+    payload_json = _json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    payload_hash = hashlib.sha256(payload_json).hexdigest()
+
+    with db() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO reports (user_id, model, payload_hash, report_md, status)
+            VALUES (%s, %s, %s, %s, 'generated')
+            RETURNING id::text, created_at
+            """,
+            (user_id, model_name, payload_hash, report_md),
+        )
+        report_id, created_at = cur.fetchone()
+
+    return {
+        "user_id": user_id,
+        "report_id": report_id,
+        "generated_at": created_at.isoformat(),
+        "model": model_name,
+        "payload_hash": payload_hash,
+        "report_md": report_md,
+    }
+
+@app.get("/api/reports", response_model=list[ReportListItem])
+def list_reports(
+    limit: int = Query(20, ge=1, le=100),
+    user_id: str = Depends(require_access_user_id),
+):
+    with db() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id::text, created_at, model, status, payload_hash
+            FROM reports
+            WHERE user_id = %s
+            ORDER BY created_at DESC
+            LIMIT %s
+            """,
+            (user_id, limit),
+        )
+        rows = cur.fetchall()
+    return [
+        {
+            "report_id": r[0],
+            "created_at": r[1],
+            "model": r[2],
+            "status": r[3],
+            "payload_hash": r[4],
+        }
+        for r in rows
+    ]
+
+@app.get("/api/reports/{report_id}", response_model=ReportDetail)
+def get_report(
+    report_id: str,
+    user_id: str = Depends(require_access_user_id),
+):
+    try:
+        uuid.UUID(report_id)
+    except ValueError:
+        raise HTTPException(400, "report_id must be a valid UUID")
+
+    with db() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id::text, created_at, model, status, payload_hash, report_md
+            FROM reports
+            WHERE id = %s AND user_id = %s
+            """,
+            (report_id, user_id),
+        )
+        row = cur.fetchone()
+    if not row:
+        raise HTTPException(404, "Report not found")
+
+    return {
+        "report_id": row[0],
+        "created_at": row[1],
+        "model": row[2],
+        "status": row[3],
+        "payload_hash": row[4],
+        "report_md": row[5],
+    }
 
 @app.post("/api/devices/register", response_model=DeviceRegisterResp)
 def register_device(req: DeviceRegisterReq):
@@ -759,30 +1266,71 @@ def end_session(req: EndSessionReq):
 def sensor_event(req: SensorEventReq):
     ts = req.ts or datetime.now(timezone.utc)
 
-    with db() as conn, conn.cursor() as cur:
-        cur.execute("SELECT id::text FROM devices WHERE device_external_id=%s;", (req.device_external_id,))
-        row = cur.fetchone()
-        if not row:
-            raise HTTPException(404, "Device not registered")
-        (device_id,) = row
+    logger.info(
+        "sensor_event received device_external_id=%s session_id=%s kind=%s seq=%s ts=%s data_keys=%s",
+        req.device_external_id,
+        req.session_id,
+        req.kind,
+        req.seq,
+        ts.isoformat(),
+        len(req.data or {}),
+    )
 
-        if req.session_id:
+    try:
+        with db() as conn, conn.cursor() as cur:
+            cur.execute("SELECT id::text FROM devices WHERE device_external_id=%s;", (req.device_external_id,))
+            row = cur.fetchone()
+            if not row:
+                logger.warning("sensor_event device_not_registered device_external_id=%s", req.device_external_id)
+                raise HTTPException(404, {"code": "DEVICE_NOT_REGISTERED", "message": "Device not registered"})
+            (device_id,) = row
+
+            if req.session_id:
+                cur.execute(
+                    "SELECT 1 FROM user_sessions WHERE id=%s AND (device_id=%s OR device_id IS NULL) LIMIT 1;",
+                    (req.session_id, device_id),
+                )
+                if not cur.fetchone():
+                    logger.warning(
+                        "sensor_event invalid_session session_id=%s device_id=%s",
+                        req.session_id,
+                        device_id,
+                    )
+                    raise HTTPException(
+                        400,
+                        {"code": "INVALID_SESSION", "message": "Invalid session_id for this device"},
+                    )
+
             cur.execute(
-                "SELECT 1 FROM user_sessions WHERE id=%s AND (device_id=%s OR device_id IS NULL) LIMIT 1;",
-                (req.session_id, device_id),
+                """
+                INSERT INTO sensor_events (session_id, device_id, ts, kind, seq, data)
+                VALUES (%s, %s, %s, %s, %s, %s::jsonb)
+                ON CONFLICT (device_id, kind, seq) WHERE seq IS NOT NULL DO NOTHING
+                """,
+                (req.session_id, device_id, ts, req.kind, req.seq, _json.dumps(req.data)),
             )
-            if not cur.fetchone():
-                raise HTTPException(400, "Invalid session_id for this device")
+            stored = cur.rowcount == 1
 
-        cur.execute(
-            """
-            INSERT INTO sensor_events (session_id, device_id, ts, kind, seq, data)
-            VALUES (%s, %s, %s, %s, %s, %s::jsonb)
-            ON CONFLICT (device_id, kind, seq) DO NOTHING
-            """,
-            (req.session_id, device_id, ts, req.kind, req.seq, _json.dumps(req.data)),
+    except HTTPException:
+        raise
+    except psycopg.Error:
+        logger.exception(
+            "sensor_event db_error device_external_id=%s session_id=%s kind=%s seq=%s",
+            req.device_external_id,
+            req.session_id,
+            req.kind,
+            req.seq,
         )
-        stored = cur.rowcount == 1
+        raise HTTPException(500, {"code": "DB_ERROR", "message": "Database error"})
+    except Exception:
+        logger.exception(
+            "sensor_event unexpected_error device_external_id=%s session_id=%s kind=%s seq=%s",
+            req.device_external_id,
+            req.session_id,
+            req.kind,
+            req.seq,
+        )
+        raise HTTPException(500, {"code": "INTERNAL_ERROR", "message": "Internal server error"})
 
     return {"ok": True, "stored": stored}
 
