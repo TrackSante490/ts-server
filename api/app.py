@@ -95,14 +95,47 @@ REFRESH_TTL_SECONDS = int(os.getenv("REFRESH_TTL_SECONDS", "2592000"))  # 30 day
 
 AUTH_ENROLLMENT_FLOW_SLUG = os.getenv("AUTH_ENROLLMENT_FLOW_SLUG", "").strip()
 
+DEFAULT_MOBILE_REDIRECT_URI = "tracksante://auth/callback"
 AUTH_REDIRECT_URI_WEB = os.getenv("AUTH_REDIRECT_URI_WEB", "https://api.tracksante.com/auth/oidc/callback")
-AUTH_REDIRECT_URI_MOBILE = os.getenv("AUTH_REDIRECT_URI_MOBILE", "https://tracksante.com/mobile/callback")
+AUTH_REDIRECT_URI_MOBILE = os.getenv("AUTH_REDIRECT_URI_MOBILE", DEFAULT_MOBILE_REDIRECT_URI)
+AUTH_ALLOWED_MOBILE_REDIRECT_URIS = tuple(
+    dict.fromkeys(
+        uri.strip()
+        for uri in os.getenv(
+            "AUTH_ALLOWED_MOBILE_REDIRECT_URIS",
+            f"{DEFAULT_MOBILE_REDIRECT_URI},{AUTH_REDIRECT_URI_MOBILE},https://tracksante.com/mobile/callback",
+        ).split(",")
+        if uri.strip()
+    )
+)
 
 REFRESH_COOKIE = "ts_refresh"
 PROFILE_FILE_MAX_MB = int(os.getenv("PROFILE_FILE_MAX_MB", "20"))
 
 
 app.mount("/assets", StaticFiles(directory="/app/assets"), name="assets")
+
+def _build_url_with_query(base_url: str, params: dict[str, str]) -> str:
+    return f"{base_url}?{urlencode(params)}"
+
+def _validate_mobile_redirect_uri(redirect_uri: str | None) -> str:
+    candidate = (redirect_uri or "").strip()
+    if not candidate:
+        raise HTTPException(400, "Missing redirect_uri")
+    if candidate not in AUTH_ALLOWED_MOBILE_REDIRECT_URIS:
+        raise HTTPException(400, "Unsupported redirect_uri")
+    return candidate
+
+def _default_mobile_redirect_uri() -> str:
+    if DEFAULT_MOBILE_REDIRECT_URI in AUTH_ALLOWED_MOBILE_REDIRECT_URIS:
+        return DEFAULT_MOBILE_REDIRECT_URI
+    return AUTH_REDIRECT_URI_MOBILE
+
+def _legacy_auth_callback_redirect_uri() -> str:
+    legacy_suffix = "/auth/oidc/callback"
+    if AUTH_REDIRECT_URI_WEB.endswith(legacy_suffix):
+        return AUTH_REDIRECT_URI_WEB[: -len(legacy_suffix)] + "/auth/callback"
+    return AUTH_REDIRECT_URI_WEB
 
 def _utcnow():
     return datetime.now(timezone.utc)
@@ -520,6 +553,7 @@ class ChatReq(BaseModel):
 class MobileExchangeReq(BaseModel):
     code: str
     code_verifier: str
+    redirect_uri: str | None = None
 
 class UserProfileUpdateReq(BaseModel):
     first_name: str | None = None
@@ -729,6 +763,7 @@ async def auth_register():
 async def auth_login(
     client: str = Query("web", pattern="^(web|mobile)$"),
     next: str | None = None,
+    redirect_uri: str | None = None,
 
     # ✅ allow mobile app to provide these
     state: str | None = None,
@@ -737,8 +772,6 @@ async def auth_login(
 ):
     if not AUTH_CLIENT_ID:
         raise HTTPException(500, "Missing AUTH_CLIENT_ID")
-
-    redirect_uri = AUTH_REDIRECT_URI_WEB if client == "web" else AUTH_REDIRECT_URI_MOBILE
 
     oidc = await _fetch_oidc_config(AUTH_INTERNAL_ISSUER)
     authorize_endpoint = oidc["authorization_endpoint"]
@@ -752,16 +785,19 @@ async def auth_login(
         # ✅ MUST use the app-provided values
         if not state or not code_challenge:
             raise HTTPException(400, "Missing state or code_challenge for mobile login")
+        mobile_redirect_uri = _validate_mobile_redirect_uri(redirect_uri or _default_mobile_redirect_uri())
 
-        url = (
-            f"{authorize_endpoint}"
-            f"?client_id={AUTH_CLIENT_ID}"
-            f"&response_type=code"
-            f"&redirect_uri={httpx.URL(redirect_uri)}"
-            f"&scope=openid%20email%20profile"
-            f"&state={state}"
-            f"&code_challenge={code_challenge}"
-            f"&code_challenge_method={code_challenge_method}"
+        url = _build_url_with_query(
+            authorize_endpoint,
+            {
+                "client_id": AUTH_CLIENT_ID,
+                "response_type": "code",
+                "redirect_uri": mobile_redirect_uri,
+                "scope": "openid email profile",
+                "state": state,
+                "code_challenge": code_challenge,
+                "code_challenge_method": code_challenge_method,
+            },
         )
         return RedirectResponse(url=url, status_code=302)
 
@@ -770,15 +806,17 @@ async def auth_login(
     verifier, challenge = _pkce_pair()
 
     resp = RedirectResponse(
-        url=(
-            f"{authorize_endpoint}"
-            f"?client_id={AUTH_CLIENT_ID}"
-            f"&response_type=code"
-            f"&redirect_uri={httpx.URL(redirect_uri)}"
-            f"&scope=openid%20email%20profile"
-            f"&state={web_state}"
-            f"&code_challenge={challenge}"
-            f"&code_challenge_method=S256"
+        url=_build_url_with_query(
+            authorize_endpoint,
+            {
+                "client_id": AUTH_CLIENT_ID,
+                "response_type": "code",
+                "redirect_uri": AUTH_REDIRECT_URI_WEB,
+                "scope": "openid email profile",
+                "state": web_state,
+                "code_challenge": challenge,
+                "code_challenge_method": "S256",
+            },
         ),
         status_code=302,
     )
@@ -796,12 +834,13 @@ async def auth_login(
 async def auth_mobile_exchange(req: MobileExchangeReq):
 
     oidc = await _fetch_oidc_config(AUTH_INTERNAL_ISSUER)
+    redirect_uri = _validate_mobile_redirect_uri(req.redirect_uri or _default_mobile_redirect_uri())
 
     tokens = await _exchange_code_for_tokens(
         oidc["token_endpoint"],
         req.code,
         req.code_verifier,
-        AUTH_REDIRECT_URI_MOBILE,
+        redirect_uri,
     )
 
     access_token = tokens.get("access_token")
@@ -844,6 +883,7 @@ async def auth_logout(response: Response):
     return {"ok": True}
 
 
+@app.get("/auth/callback")
 @app.get("/auth/oidc/callback")
 async def auth_oidc_callback(request: Request, code: str | None = None, state: str | None = None):
     if not code or not state:
@@ -857,7 +897,10 @@ async def auth_oidc_callback(request: Request, code: str | None = None, state: s
     oidc = await _fetch_oidc_config(AUTH_INTERNAL_ISSUER)
 
     client_kind = request.cookies.get("oidc_client", "web")
-    redirect_uri = AUTH_REDIRECT_URI_WEB if client_kind == "web" else AUTH_REDIRECT_URI_MOBILE
+    if client_kind == "web" and request.url.path == "/auth/callback":
+        redirect_uri = _legacy_auth_callback_redirect_uri()
+    else:
+        redirect_uri = AUTH_REDIRECT_URI_WEB if client_kind == "web" else _default_mobile_redirect_uri()
 
     tokens = await _exchange_code_for_tokens(oidc["token_endpoint"], code, verifier, redirect_uri)
 

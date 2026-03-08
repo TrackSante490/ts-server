@@ -1,0 +1,183 @@
+<title>TRACKSANTE TEST</title>
+
+
+
+
+<!DOCTYPE html>
+
+<html>
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+        
+        <meta name="darkreader-lock">
+        <title>
+TrackSanté
+</title>
+        <link rel="icon" href="/media/favicon.png">
+        <link rel="shortcut icon" href="/media/favicon.png">
+        
+<link rel="prefetch" href="/static/dist/assets/images/flow_background.jpg" />
+<link rel="stylesheet" type="text/css" href="/static/dist/patternfly.min.css">
+<link rel="stylesheet" type="text/css" href="/static/dist/theme-dark.css" media="(prefers-color-scheme: dark)">
+
+
+
+<script>
+    window.authentik = {
+        locale: "en-us",
+        config: JSON.parse(''),
+        brand: JSON.parse(''),
+        versionFamily: "",
+        versionSubdomain: "",
+        build: "",
+        api: {
+            base: "",
+            relBase: "",
+        },
+    };
+    window.addEventListener("DOMContentLoaded", function () {
+        
+    });
+</script>
+
+
+        <link rel="stylesheet" type="text/css" href="/static/dist/authentik.css">
+        <link rel="stylesheet" type="text/css" href="/static/dist/custom.css?v=1" data-inject>
+        <style>
+            /* App background */
+            html, body {
+                height: 100%;
+                background: #0f1115 !important;
+            }
+
+            /* Kill flow background image entirely (even if set) */
+            :root { --ak-flow-background: none !important; }
+            ak-flow-executor::part(background),
+            ak-flow-executor::part(container) {
+                background: transparent !important;
+            }
+
+            /* Center the flow content like your Flutter card screen */
+            ak-flow-executor {
+                min-height: 100vh !important;
+                display: grid !important;
+                place-items: center !important;
+                padding: 24px !important;
+            }
+
+            /* Card look (most important) */
+            ak-flow-executor::part(card),
+            ak-flow-executor::part(content),
+            .pf-c-card,
+            .pf-c-login__main {
+                max-width: 420px !important;
+                width: 100% !important;
+                background: #171a21 !important;
+                border: 1px solid rgba(255,255,255,0.08) !important;
+                border-radius: 16px !important;
+                box-shadow: 0 12px 40px rgba(0,0,0,0.45) !important;
+                padding: 24px !important;
+            }
+
+            /* Inputs */
+            input, .pf-c-form-control {
+                background: #10131a !important;
+                border: 1px solid rgba(255,255,255,0.12) !important;
+                border-radius: 12px !important;
+                color: #e9eef7 !important;
+            }
+
+            /* Primary button */
+            button.pf-m-primary, .pf-c-button.pf-m-primary {
+                border-radius: 12px !important;
+                padding: 10px 14px !important;
+                font-weight: 600 !important;
+            }
+
+            /* Hide "Powered by authentik" */
+            ak-interface-footer, .pf-c-login__footer {
+                display: none !important;
+            }
+        </style>
+        <script src="/static/dist/poly-2025.2.4.js" type="module"></script>
+        <script src="/static/dist/standalone/loading/index-2025.2.4.js" type="module"></script>
+        
+<style>
+:root {
+    --ak-flow-background: url("/static/dist/assets/images/flow_background.jpg");
+    --pf-c-background-image--BackgroundImage: var(--ak-flow-background);
+    --pf-c-background-image--BackgroundImage-2x: var(--ak-flow-background);
+    --pf-c-background-image--BackgroundImage--sm: var(--ak-flow-background);
+    --pf-c-background-image--BackgroundImage--sm-2x: var(--ak-flow-background);
+    --pf-c-background-image--BackgroundImage--lg: var(--ak-flow-background);
+}
+/* Form with user */
+.form-control-static {
+    margin-top: var(--pf-global--spacer--sm);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+}
+.form-control-static .avatar {
+    display: flex;
+    align-items: center;
+}
+.form-control-static img {
+    margin-right: var(--pf-global--spacer--xs);
+}
+.form-control-static a {
+    padding-top: var(--pf-global--spacer--xs);
+    padding-bottom: var(--pf-global--spacer--xs);
+    line-height: var(--pf-global--spacer--xl);
+}
+</style>
+
+        <meta name="sentry-trace" content="8128cde89be04a4bab0cc401edc66079-9f8d8b6f7248b584-0" />
+    </head>
+    <body>
+        
+<div class="pf-c-background-image">
+</div>
+<ak-message-container></ak-message-container>
+<div class="pf-c-login stacked">
+    <div class="ak-login-container">
+        <main class="pf-c-login__main">
+            <div class="pf-c-login__main-header pf-c-brand ak-brand">
+                <img src="/media/tracksante-logo.png" alt="authentik Logo" />
+            </div>
+            <header class="pf-c-login__main-header">
+                <h1 class="pf-c-title pf-m-3xl">
+                    
+Redirect URI Error
+
+                </h1>
+            </header>
+            <div class="pf-c-login__main-body">
+                
+<form method="POST" class="pf-c-form">
+    <p>The request fails due to a missing, invalid, or mismatching redirection URI (redirect_uri).</p>
+    <a id="ak-back-home" href="/" class="pf-c-button pf-m-primary">
+        Go home
+    </a>
+</form>
+
+            </div>
+        </main>
+        <footer class="pf-c-login__footer">
+            <ul class="pf-c-list pf-m-inline">
+                
+                <li>
+                    <span>
+                        Powered by authentik
+                    </span>
+                </li>
+            </ul>
+        </footer>
+    </div>
+</div>
+
+        
+        
+    </body>
+</html>
