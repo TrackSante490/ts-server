@@ -23,7 +23,7 @@ Each service is listed below with its role, how it connects to other services, a
 | `authentik-server` | Authentik web UI and API for identity, SSO, and user management. | Runs on `9002` (HTTP) and `9443` (optional HTTPS). Stores media in `authentik-media/` and uses custom templates/branding mounted from this repo. |
 | `authentik-worker` | Background job processor for Authentik (emails, tasks, workflows). | Shares config with the Authentik server and connects to Authentik Postgres + Redis. |
 | `tracksante-site` | Static marketing site hosted by Nginx. | Serves files from `/srv/tracksante-site` inside the container on port `8088`. |
-| `tracksante-app` | Static web application hosted by Nginx. | Serves files from `/srv/tracksante-app` on port `8089`, with a custom Nginx config at `nginx/tracksante-app.conf`. |
+| `tracksante-app` | Static web application hosted by Nginx. | Serves files from `/srv/tracksante-app` on port `8089`, with a custom Nginx config at `tracksante-app.conf`. |
 
 ## How It Fits Together
 

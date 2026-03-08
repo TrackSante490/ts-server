@@ -17,14 +17,14 @@ tracksante-app:
   restart: unless-stopped
   volumes:
     - /srv/tracksante-app:/usr/share/nginx/html:ro
-    - ./nginx/tracksante-app.conf:/etc/nginx/conf.d/default.conf:ro
+    - ./tracksante-app.conf:/etc/nginx/conf.d/default.conf:ro
   ports:
     - "8089:80"
 ````
 
 ---
 
-## 2) Nginx config (`nginx/tracksante-app.conf`)
+## 2) Nginx config (`tracksante-app.conf`)
 
 ```nginx
 server {
