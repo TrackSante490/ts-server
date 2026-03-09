@@ -47,7 +47,7 @@ Below is a practical, human‑readable map of the API routes in `api/app.py` and
 | `POST` | `/auth/mobile/exchange` | Exchanges an auth code + PKCE verifier for TrackSanté access/refresh tokens. | Mobile‑only flow; returns JWTs in JSON. |
 | `GET` | `/auth/oidc/callback` | Completes OIDC login, creates/links user, and sets refresh cookie. | Redirects to the app/site after login. |
 | `POST` | `/auth/logout` | Clears the refresh cookie. | Stateless; returns `{ok: true}`. |
-| `POST` | `/auth/refresh` | Issues a new access token from a refresh cookie. | Returns `{access_token}`. |
+| `POST` | `/auth/refresh` | Issues a new access token from a refresh cookie. | Returns `{access_token, user_id}`. |
 | `GET` | `/auth/me` | Returns the current user ID from the access token. | Requires `Authorization: Bearer <access_token>`. |
 
 ### Health and Debug

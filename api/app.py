@@ -972,7 +972,7 @@ def auth_refresh(request: Request):
 
     user_id = payload["sub"]
     access = make_access_token(user_id)
-    return {"access_token": access}
+    return {"access_token": access, "user_id": user_id}
 
 
 bearer = HTTPBearer(auto_error=False)
