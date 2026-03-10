@@ -90,7 +90,7 @@ sudo journalctl -u tracksante-uptime-week.service -f
 sudo systemctl stop tracksante-uptime-week.service
 ```
 
-The service template is in `scripts/verification/systemd/`. If your deployment user is not `rishit`, the install script fills in the current user automatically.
+The service template is in `scripts/verification/systemd/`. The install script fills in the current user automatically.
 
 ## Example Commands
 

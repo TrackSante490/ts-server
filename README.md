@@ -106,7 +106,7 @@ Below is a practical, human‑readable map of the API routes in `api/app.py` and
 | --- | --- |
 | API | `8080` |
 | Adminer | `8081` |
-| Grafana | `3000` |
+| Grafana (local bind / tunnel origin) | `3000` |
 | Postgres | `5432` |
 | MinIO S3 API | `9000` |
 | MinIO Console | `9001` |
@@ -119,10 +119,13 @@ Below is a practical, human‑readable map of the API routes in `api/app.py` and
 ## Observability
 
 - API metrics are exposed at `/metrics` and include HTTP traffic, dependency health, sensor ingestion, and chat/RAG counters.
-- Grafana is available at `http://localhost:3000` and is provisioned automatically with:
+- Grafana is deployed at `https://grafana.tracksante.com` and served locally from port `3000`.
+- Grafana is provisioned automatically with:
+  - `TrackSante Daily Health Overview`
   - `TrackSante Infrastructure Overview`
   - `TrackSante Product Telemetry`
   - `TrackSante RAG and LLM Observability`
+  - `TrackSante Verification Overview`
 - Prometheus is available at `http://localhost:9090`.
 - See `docs/observability/stack.md` for setup details and dashboard intent.
 
