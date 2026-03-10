@@ -26,3 +26,5 @@ vectordb/
 *.sqlite3
 *.bin
 *.deployed_sha
+test-results/*
+!test-results/.gitkeep

@@ -1,0 +1,18 @@
+[Unit]
+Description=TrackSante one-week uptime verification run
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+Group=__GROUP__
+WorkingDirectory=/srv/capstone
+Environment=TRACKSANTE_API_BASE_URL=http://127.0.0.1:8080
+ExecStart=/srv/capstone/scripts/verification/run_verification_suite.sh uptime-week
+Restart=no
+KillSignal=SIGINT
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

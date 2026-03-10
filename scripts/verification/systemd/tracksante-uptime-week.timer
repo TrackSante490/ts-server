@@ -1,0 +1,10 @@
+[Unit]
+Description=Start the TrackSante one-week uptime verification run weekly
+
+[Timer]
+OnCalendar=Mon *-*-* 00:00:00
+Persistent=true
+Unit=tracksante-uptime-week.service
+
+[Install]
+WantedBy=timers.target

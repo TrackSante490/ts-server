@@ -18,6 +18,8 @@ Each service is listed below with its role, how it connects to other services, a
 | `ollama` | Local LLM runtime used for chat and embeddings. | Runs inside the Docker network (no public port). The API calls it at `http://ollama:11434`. GPU reservation is enabled for NVIDIA devices. Model state is persisted in the `ollama-data` volume. |
 | `ollama-init` | Warm‑starts the model runtime by pulling models on startup. | Pulls `OLLAMA_CHAT_MODEL` and `OLLAMA_EMBED_MODEL` defined in `.env`. Runs once after Ollama is reachable. |
 | `adminer` | Simple database UI for Postgres. | Accessible at `http://localhost:8081`. Useful for quick schema checks and manual queries. |
+| `prometheus` | Scrapes the API `/metrics` endpoint and stores time-series metrics locally. | Powers infrastructure and RAG/LLM monitoring dashboards in Grafana. |
+| `grafana` | Self-hosted dashboard UI for infrastructure, product telemetry, and RAG observability. | Provisioned from `observability/grafana/` with Prometheus + Postgres datasources. |
 | `authentik-postgresql` | Dedicated Postgres instance for Authentik. | Persists to `authentik-pgdata/`. Separate from the main `db` to keep auth data isolated. |
 | `authentik-redis` | Redis backend for Authentik background tasks and caching. | Internal‑only dependency for Authentik server/worker. |
 | `authentik-server` | Authentik web UI and API for identity, SSO, and user management. | Runs on `9002` (HTTP) and `9443` (optional HTTPS). Stores media in `authentik-media/` and uses custom templates/branding mounted from this repo. |
@@ -104,13 +106,25 @@ Below is a practical, human‑readable map of the API routes in `api/app.py` and
 | --- | --- |
 | API | `8080` |
 | Adminer | `8081` |
+| Grafana | `3000` |
 | Postgres | `5432` |
 | MinIO S3 API | `9000` |
 | MinIO Console | `9001` |
 | Authentik UI | `9002` |
+| Prometheus | `9090` |
 | Authentik HTTPS (optional) | `9443` |
 | TrackSanté Site | `8088` |
 | TrackSanté App | `8089` |
+
+## Observability
+
+- API metrics are exposed at `/metrics` and include HTTP traffic, dependency health, sensor ingestion, and chat/RAG counters.
+- Grafana is available at `http://localhost:3000` and is provisioned automatically with:
+  - `TrackSante Infrastructure Overview`
+  - `TrackSante Product Telemetry`
+  - `TrackSante RAG and LLM Observability`
+- Prometheus is available at `http://localhost:9090`.
+- See `docs/observability/stack.md` for setup details and dashboard intent.
 
 ## Data That Persists Locally
 

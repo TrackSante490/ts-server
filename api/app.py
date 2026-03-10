@@ -18,8 +18,17 @@ import boto3, psycopg
 from psycopg.types import json as psyjson  # (optional, handy if you use psyjson.Json)
 from psycopg.errors import UniqueViolation
 import json as _json
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from urllib.parse import urlsplit, urlunsplit, urlencode
 import jwt
+from observability import (
+    observe_chat_request,
+    observe_dependency_probe,
+    observe_http_request,
+    observe_rag_chat_turn,
+    observe_rag_error,
+    observe_sensor_event,
+)
 
 # ---- logging ----
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -89,6 +98,7 @@ JWT_ISSUER = os.getenv("JWT_ISSUER", "tracksante-api")
 JWT_AUDIENCE = os.getenv("JWT_AUDIENCE", "tracksante")
 REPORT_MODEL_DEFAULT = os.getenv("REPORT_MODEL", os.getenv("OLLAMA_CHAT_MODEL", "llama3.1"))
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
+METRICS_PROBE_TIMEOUT_SECONDS = float(os.getenv("METRICS_PROBE_TIMEOUT_SECONDS", "2.0"))
 
 ACCESS_TTL_SECONDS = int(os.getenv("ACCESS_TTL_SECONDS", "900"))        # 15 min
 REFRESH_TTL_SECONDS = int(os.getenv("REFRESH_TTL_SECONDS", "2592000"))  # 30 days
@@ -114,6 +124,28 @@ PROFILE_FILE_MAX_MB = int(os.getenv("PROFILE_FILE_MAX_MB", "20"))
 
 
 app.mount("/assets", StaticFiles(directory="/app/assets"), name="assets")
+
+
+@app.middleware("http")
+async def prometheus_http_middleware(request: Request, call_next):
+    if request.url.path == "/metrics":
+        return await call_next(request)
+
+    start = time.perf_counter()
+    status_code = 500
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        return response
+    finally:
+        route = request.scope.get("route")
+        route_path = getattr(route, "path", request.url.path)
+        observe_http_request(
+            method=request.method,
+            route=route_path,
+            status=status_code,
+            duration_seconds=time.perf_counter() - start,
+        )
 
 def _build_url_with_query(base_url: str, params: dict[str, str]) -> str:
     return f"{base_url}?{urlencode(params)}"
@@ -510,6 +542,57 @@ def make_refresh_token(user_id: str) -> str:
 
 def db():
     return psycopg.connect(DBURL)
+
+
+def _probe_db() -> tuple[bool, float]:
+    start = time.perf_counter()
+    try:
+        with db() as conn, conn.cursor() as cur:
+            cur.execute("SELECT 1;")
+            cur.fetchone()
+        return True, time.perf_counter() - start
+    except Exception:
+        return False, time.perf_counter() - start
+
+
+def _probe_minio() -> tuple[bool, float]:
+    start = time.perf_counter()
+    try:
+        S3.list_buckets()
+        return True, time.perf_counter() - start
+    except Exception:
+        return False, time.perf_counter() - start
+
+
+def _probe_authentik() -> tuple[bool, float]:
+    start = time.perf_counter()
+    try:
+        with httpx.Client(timeout=METRICS_PROBE_TIMEOUT_SECONDS, follow_redirects=True) as client:
+            response = client.get(AUTH_INTERNAL_ISSUER + ".well-known/openid-configuration")
+        return response.status_code < 500, time.perf_counter() - start
+    except Exception:
+        return False, time.perf_counter() - start
+
+
+def _probe_ollama() -> tuple[bool, float]:
+    start = time.perf_counter()
+    try:
+        with httpx.Client(timeout=METRICS_PROBE_TIMEOUT_SECONDS) as client:
+            response = client.get(f"{OLLAMA_BASE_URL.rstrip('/')}/api/tags")
+        return response.status_code < 500, time.perf_counter() - start
+    except Exception:
+        return False, time.perf_counter() - start
+
+
+def refresh_dependency_metrics() -> None:
+    for service, probe in (
+        ("db", _probe_db),
+        ("minio", _probe_minio),
+        ("authentik", _probe_authentik),
+        ("ollama", _probe_ollama),
+    ):
+        up, duration = probe()
+        observe_dependency_probe(service=service, up=up, duration_seconds=duration)
 
 # --------- models/auth ----------
 class CreateUserResp(BaseModel):
@@ -1003,6 +1086,12 @@ def auth_me(user_id: str = Depends(require_access_user_id)):
 
 
 # --------- routes ----------
+@app.get("/metrics")
+async def metrics():
+    await run_in_threadpool(refresh_dependency_metrics)
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
 @app.get("/api/health")
 def health():
     return {"ok": True, "time": time.time()}
@@ -1325,6 +1414,7 @@ def sensor_event(req: SensorEventReq):
             row = cur.fetchone()
             if not row:
                 logger.warning("sensor_event device_not_registered device_external_id=%s", req.device_external_id)
+                observe_sensor_event(req.kind, "device_not_registered")
                 raise HTTPException(404, {"code": "DEVICE_NOT_REGISTERED", "message": "Device not registered"})
             (device_id,) = row
 
@@ -1339,6 +1429,7 @@ def sensor_event(req: SensorEventReq):
                         req.session_id,
                         device_id,
                     )
+                    observe_sensor_event(req.kind, "invalid_session")
                     raise HTTPException(
                         400,
                         {"code": "INVALID_SESSION", "message": "Invalid session_id for this device"},
@@ -1353,10 +1444,12 @@ def sensor_event(req: SensorEventReq):
                 (req.session_id, device_id, ts, req.kind, req.seq, _json.dumps(req.data)),
             )
             stored = cur.rowcount == 1
+            observe_sensor_event(req.kind, "stored" if stored else "duplicate")
 
     except HTTPException:
         raise
     except psycopg.Error:
+        observe_sensor_event(req.kind, "db_error")
         logger.exception(
             "sensor_event db_error device_external_id=%s session_id=%s kind=%s seq=%s",
             req.device_external_id,
@@ -1366,6 +1459,7 @@ def sensor_event(req: SensorEventReq):
         )
         raise HTTPException(500, {"code": "DB_ERROR", "message": "Database error"})
     except Exception:
+        observe_sensor_event(req.kind, "internal_error")
         logger.exception(
             "sensor_event unexpected_error device_external_id=%s session_id=%s kind=%s seq=%s",
             req.device_external_id,
@@ -1599,121 +1693,153 @@ async def chat(req: ChatReq, authorization: str | None = Header(None)):
     # auth_device(authorization, "kit-001")
     from rag_conv.rag_agent import chat_once
 
+    start = time.perf_counter()
+    rag_invoked = False
+    result_label = "error"
+    next_step = None
+    recommended_sensor = None
     try:
-        uuid.UUID(req.user_id)
-    except ValueError:
-        raise HTTPException(400, "user_id must be a valid UUID from users.id")
+        try:
+            uuid.UUID(req.user_id)
+        except ValueError:
+            raise HTTPException(400, "user_id must be a valid UUID from users.id")
 
-    session_id = req.session_id
-    with db() as conn, conn.cursor() as cur:
-        cur.execute("SELECT 1 FROM users WHERE id=%s LIMIT 1;", (req.user_id,))
-        if not cur.fetchone():
-            raise HTTPException(404, "User not found")
+        session_id = req.session_id
+        with db() as conn, conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM users WHERE id=%s LIMIT 1;", (req.user_id,))
+            if not cur.fetchone():
+                raise HTTPException(404, "User not found")
 
-        # Validate/create DB-backed session so chat rows always link to a user.
-        if session_id:
-            try:
-                uuid.UUID(session_id)
-            except ValueError:
-                # Backward compatibility: older clients may send timestamp-style session IDs.
-                # Treat those as "no session" and create a fresh DB-backed UUID session.
-                session_id = None
-
+            # Validate/create DB-backed session so chat rows always link to a user.
             if session_id:
+                try:
+                    uuid.UUID(session_id)
+                except ValueError:
+                    # Backward compatibility: older clients may send timestamp-style session IDs.
+                    # Treat those as "no session" and create a fresh DB-backed UUID session.
+                    session_id = None
+
+                if session_id:
+                    cur.execute(
+                        "SELECT 1 FROM user_sessions WHERE id=%s AND user_id=%s LIMIT 1;",
+                        (session_id, req.user_id),
+                    )
+                    if not cur.fetchone():
+                        raise HTTPException(400, "Invalid session_id for this user")
+            else:
                 cur.execute(
-                    "SELECT 1 FROM user_sessions WHERE id=%s AND user_id=%s LIMIT 1;",
-                    (session_id, req.user_id),
+                    """
+                    INSERT INTO user_sessions (user_id, started_at, meta)
+                    VALUES (%s, now(), %s::jsonb)
+                    RETURNING id::text;
+                    """,
+                    (req.user_id, _json.dumps({"source": "api_chat"})),
                 )
-                if not cur.fetchone():
-                    raise HTTPException(400, "Invalid session_id for this user")
-        else:
-            cur.execute(
-                """
-                INSERT INTO user_sessions (user_id, started_at, meta)
-                VALUES (%s, now(), %s::jsonb)
-                RETURNING id::text;
-                """,
-                (req.user_id, _json.dumps({"source": "api_chat"})),
+                (session_id,) = cur.fetchone()
+
+        try:
+            rag_invoked = True
+            chat_result = await run_in_threadpool(
+                chat_once,
+                user_id=req.user_id,
+                user_message=req.message,
+                session_id=session_id
             )
-            (session_id,) = cur.fetchone()
+        except Exception:
+            observe_rag_error("chat_once")
+            raise
 
-    chat_result = await run_in_threadpool(
-        chat_once,
-        user_id=req.user_id,
-        user_message=req.message,
-        session_id=session_id
-    )
+        assistant_message = chat_result.get("assistant_message")
+        if not isinstance(assistant_message, str):
+            assistant_message = _json.dumps(chat_result, ensure_ascii=False)
 
-    assistant_message = chat_result.get("assistant_message")
-    if not isinstance(assistant_message, str):
-        assistant_message = _json.dumps(chat_result, ensure_ascii=False)
+        try:
+            with db() as conn, conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO session_messages (session_id, role, content, meta)
+                    VALUES (%s, 'user', %s, %s::jsonb)
+                    """,
+                    (session_id, req.message, _json.dumps({})),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO session_messages (session_id, role, content, meta)
+                    VALUES (%s, 'assistant', %s, %s::jsonb)
+                    """,
+                    (session_id, assistant_message, _json.dumps(chat_result)),
+                )
 
-    with db() as conn, conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO session_messages (session_id, role, content, meta)
-            VALUES (%s, 'user', %s, %s::jsonb)
-            """,
-            (session_id, req.message, _json.dumps({})),
+                recommended_sensor = chat_result.get("recommended_sensor")
+                next_step = chat_result.get("suggested_next_step")
+                recommended_measurements = chat_result.get("recommended_measurements")
+                if not isinstance(recommended_measurements, list):
+                    recommended_measurements = []
+                sensor_confidence = chat_result.get("sensor_confidence")
+                is_actionable_sensor = (
+                    recommended_sensor in {
+                        "Humidity Sensor",
+                        "CO2 Sensor",
+                        "Temperature Sensor",
+                        "Heart Rate Sensor",
+                        "Blood Oxygen Sensor",
+                        # Backward compatibility for older prompt/output naming.
+                        "Pulse Oxygen Sensor",
+                    }
+                    and next_step == "proceed_to_measurements"
+                )
+
+                session_signal = {
+                    "last_recommended_sensor": recommended_sensor,
+                    "last_suggested_next_step": next_step,
+                    "last_recommended_measurements": recommended_measurements,
+                    "last_sensor_confidence": sensor_confidence,
+                    "last_is_actionable_sensor": is_actionable_sensor,
+                    "last_assistant_message": assistant_message,
+                    "last_chat_at": _utcnow().isoformat(),
+                }
+                cur.execute(
+                    """
+                    UPDATE user_sessions
+                    SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb
+                    WHERE id = %s AND user_id = %s
+                    """,
+                    (_json.dumps(session_signal), session_id, req.user_id),
+                )
+
+                collected_facts = chat_result.get("collected_facts")
+                if isinstance(collected_facts, dict) and collected_facts:
+                    cur.execute(
+                        """
+                        INSERT INTO user_memory (user_id, memory, updated_at)
+                        VALUES (%s, %s::jsonb, now())
+                        ON CONFLICT (user_id)
+                        DO UPDATE SET
+                          memory = user_memory.memory || EXCLUDED.memory,
+                          updated_at = now();
+                        """,
+                        (req.user_id, _json.dumps(collected_facts)),
+                    )
+        except Exception:
+            observe_rag_error("chat_persistence")
+            raise
+
+        chat_result["session_id"] = session_id
+        result_label = "ok"
+        return chat_result
+    finally:
+        duration_seconds = time.perf_counter() - start
+        observe_chat_request(
+            result=result_label,
+            duration_seconds=duration_seconds,
+            next_step=next_step,
+            recommended_sensor=recommended_sensor,
         )
-        cur.execute(
-            """
-            INSERT INTO session_messages (session_id, role, content, meta)
-            VALUES (%s, 'assistant', %s, %s::jsonb)
-            """,
-            (session_id, assistant_message, _json.dumps(chat_result)),
-        )
-
-        recommended_sensor = chat_result.get("recommended_sensor")
-        suggested_next_step = chat_result.get("suggested_next_step")
-        recommended_measurements = chat_result.get("recommended_measurements")
-        if not isinstance(recommended_measurements, list):
-            recommended_measurements = []
-        sensor_confidence = chat_result.get("sensor_confidence")
-        is_actionable_sensor = (
-            recommended_sensor in {
-                "Humidity Sensor",
-                "CO2 Sensor",
-                "Temperature Sensor",
-                "Heart Rate Sensor",
-                "Blood Oxygen Sensor",
-                # Backward compatibility for older prompt/output naming.
-                "Pulse Oxygen Sensor",
-            }
-            and suggested_next_step == "proceed_to_measurements"
-        )
-
-        session_signal = {
-            "last_recommended_sensor": recommended_sensor,
-            "last_suggested_next_step": suggested_next_step,
-            "last_recommended_measurements": recommended_measurements,
-            "last_sensor_confidence": sensor_confidence,
-            "last_is_actionable_sensor": is_actionable_sensor,
-            "last_assistant_message": assistant_message,
-            "last_chat_at": _utcnow().isoformat(),
-        }
-        cur.execute(
-            """
-            UPDATE user_sessions
-            SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb
-            WHERE id = %s AND user_id = %s
-            """,
-            (_json.dumps(session_signal), session_id, req.user_id),
-        )
-
-        collected_facts = chat_result.get("collected_facts")
-        if isinstance(collected_facts, dict) and collected_facts:
-            cur.execute(
-                """
-                INSERT INTO user_memory (user_id, memory, updated_at)
-                VALUES (%s, %s::jsonb, now())
-                ON CONFLICT (user_id)
-                DO UPDATE SET
-                  memory = user_memory.memory || EXCLUDED.memory,
-                  updated_at = now();
-                """,
-                (req.user_id, _json.dumps(collected_facts)),
+        if rag_invoked:
+            observe_rag_chat_turn(
+                result=result_label,
+                duration_seconds=duration_seconds,
+                next_step=next_step,
+                recommended_sensor=recommended_sensor,
             )
-
-    chat_result["session_id"] = session_id
-    return chat_result
+    
