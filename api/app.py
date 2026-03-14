@@ -175,6 +175,14 @@ def _utcnow():
 def _iso(dt: datetime | None) -> str | None:
     return dt.isoformat() if dt else None
 
+def _validated_uuid_str(value: str | None, field_name: str) -> str | None:
+    if not value:
+        return None
+    try:
+        return str(uuid.UUID(value))
+    except ValueError as exc:
+        raise HTTPException(400, f"{field_name} must be a UUID") from exc
+
 def build_report_payload(user_id: str, limit_sessions: int, limit_events: int) -> dict[str, Any]:
     # Build a compact payload for report generation.
     with db() as conn, conn.cursor() as cur:
@@ -326,6 +334,7 @@ def build_report_payload(user_id: str, limit_sessions: int, limit_events: int) -
                 """
                 SELECT se.id,
                        se.session_id::text,
+                       se.measurement_run_id::text,
                        se.device_id::text,
                        se.ts,
                        se.kind,
@@ -343,66 +352,77 @@ def build_report_payload(user_id: str, limit_sessions: int, limit_events: int) -
                 {
                     "id": r[0],
                     "session_id": r[1],
-                    "device_id": r[2],
-                    "ts": _iso(r[3]),
-                    "kind": r[4],
-                    "seq": r[5],
-                    "data": r[6] or {},
+                    "measurement_run_id": r[2],
+                    "device_id": r[3],
+                    "ts": _iso(r[4]),
+                    "_ts": r[4],
+                    "kind": r[5],
+                    "seq": r[6],
+                    "data": r[7] or {},
                 }
                 for r in cur.fetchall()
             ]
 
-        sensor_vitals = {}
-        sensor_summary = {}
-        if sensor_events:
-            def _collect_values(kinds: set[str], keys: list[str]):
-                vals = []
-                for ev in sensor_events:
-                    if ev.get("kind") in kinds:
-                        n = _extract_from_data(ev.get("data") or {}, keys)
-                        if n is not None:
-                            vals.append(n)
-                        continue
+        def _collect_values(events: list[dict], kinds: set[str], keys: list[str]):
+            vals = []
+            for ev in events:
+                if ev.get("kind") in kinds:
                     n = _extract_from_data(ev.get("data") or {}, keys)
                     if n is not None:
                         vals.append(n)
-                return vals
+                    continue
+                n = _extract_from_data(ev.get("data") or {}, keys)
+                if n is not None:
+                    vals.append(n)
+            return vals
 
-            def _range(vals: list[float], min_allowed: float | None = None, max_allowed: float | None = None):
-                cleaned = []
-                for v in vals:
-                    if v is None:
-                        continue
-                    if min_allowed is not None and v < min_allowed:
-                        continue
-                    if max_allowed is not None and v > max_allowed:
-                        continue
-                    cleaned.append(v)
-                if not cleaned:
-                    return None
-                return {"min": min(cleaned), "max": max(cleaned)}
+        def _range(vals: list[float], min_allowed: float | None = None, max_allowed: float | None = None):
+            cleaned = []
+            for v in vals:
+                if v is None:
+                    continue
+                if min_allowed is not None and v < min_allowed:
+                    continue
+                if max_allowed is not None and v > max_allowed:
+                    continue
+                cleaned.append(v)
+            if not cleaned:
+                return None
+            return {"min": min(cleaned), "max": max(cleaned)}
+
+        def _summarize_sensor_events(events: list[dict]) -> tuple[dict[str, Any], dict[str, Any]]:
+            sensor_vitals: dict[str, Any] = {}
+            sensor_summary: dict[str, Any] = {}
+            if not events:
+                return sensor_vitals, sensor_summary
+
+            ordered_events = sorted(
+                events,
+                key=lambda ev: ev.get("_ts") or datetime.min.replace(tzinfo=timezone.utc),
+                reverse=True,
+            )
 
             hr = _latest_measurement(
-                sensor_events,
+                ordered_events,
                 {"hr", "heart_rate", "pulse"},
                 ["hr", "heart_rate", "pulse", "bpm", "value"],
             )
             spo2 = _latest_measurement(
-                sensor_events,
+                ordered_events,
                 {"spo2", "pulse_ox", "pulse_oxygen", "oxygen"},
                 ["spo2", "oxygen_saturation", "oxygen", "o2", "value"],
             )
             temp = _latest_measurement(
-                sensor_events,
+                ordered_events,
                 {"temp", "temperature", "body_temp"},
                 ["temp", "temperature", "celsius", "value"],
             )
             rr = _latest_measurement(
-                sensor_events,
+                ordered_events,
                 {"rr", "resp_rate", "respiratory_rate"},
                 ["rr", "resp_rate", "respiratory_rate", "value"],
             )
-            bp = _latest_bp(sensor_events)
+            bp = _latest_bp(ordered_events)
             if hr is not None:
                 sensor_vitals["hr"] = hr
             if spo2 is not None:
@@ -414,10 +434,10 @@ def build_report_payload(user_id: str, limit_sessions: int, limit_events: int) -
             if bp is not None:
                 sensor_vitals["bp"] = bp
 
-            hr_vals = _collect_values({"hr", "heart_rate", "pulse"}, ["hr", "heart_rate", "pulse", "bpm", "value"])
-            spo2_vals = _collect_values({"spo2", "pulse_ox", "pulse_oxygen", "oxygen"}, ["spo2", "oxygen_saturation", "oxygen", "o2", "value"])
-            temp_vals = _collect_values({"temp", "temperature", "body_temp"}, ["temp", "temperature", "celsius", "value"])
-            rr_vals = _collect_values({"rr", "resp_rate", "respiratory_rate"}, ["rr", "resp_rate", "respiratory_rate", "value"])
+            hr_vals = _collect_values(ordered_events, {"hr", "heart_rate", "pulse"}, ["hr", "heart_rate", "pulse", "bpm", "value"])
+            spo2_vals = _collect_values(ordered_events, {"spo2", "pulse_ox", "pulse_oxygen", "oxygen"}, ["spo2", "oxygen_saturation", "oxygen", "o2", "value"])
+            temp_vals = _collect_values(ordered_events, {"temp", "temperature", "body_temp"}, ["temp", "temperature", "celsius", "value"])
+            rr_vals = _collect_values(ordered_events, {"rr", "resp_rate", "respiratory_rate"}, ["rr", "resp_rate", "respiratory_rate", "value"])
 
             hr_range = _range(hr_vals, min_allowed=1)
             spo2_range = _range(spo2_vals, min_allowed=1, max_allowed=100)
@@ -432,6 +452,70 @@ def build_report_payload(user_id: str, limit_sessions: int, limit_events: int) -
                 sensor_summary["temp"] = temp_range
             if rr_range:
                 sensor_summary["rr"] = rr_range
+
+            return sensor_vitals, sensor_summary
+
+        def _group_measurement_runs(events: list[dict]) -> list[dict[str, Any]]:
+            grouped: dict[str, dict[str, Any]] = {}
+            for ev in events:
+                run_id = ev.get("measurement_run_id")
+                ts_dt = ev.get("_ts")
+                if not run_id or ts_dt is None:
+                    continue
+                group = grouped.setdefault(
+                    run_id,
+                    {
+                        "measurement_run_id": run_id,
+                        "session_id": ev.get("session_id"),
+                        "_started_ts": ts_dt,
+                        "_ended_ts": ts_dt,
+                        "event_count": 0,
+                        "kinds": set(),
+                        "_events": [],
+                    },
+                )
+                if not group.get("session_id") and ev.get("session_id"):
+                    group["session_id"] = ev.get("session_id")
+                if ts_dt < group["_started_ts"]:
+                    group["_started_ts"] = ts_dt
+                if ts_dt > group["_ended_ts"]:
+                    group["_ended_ts"] = ts_dt
+                if ev.get("kind"):
+                    group["kinds"].add(ev["kind"])
+                group["event_count"] += 1
+                group["_events"].append(ev)
+
+            runs: list[dict[str, Any]] = []
+            for group in grouped.values():
+                run_vitals, run_summary = _summarize_sensor_events(group["_events"])
+                runs.append(
+                    {
+                        "measurement_run_id": group["measurement_run_id"],
+                        "session_id": group.get("session_id"),
+                        "started_at": _iso(group["_started_ts"]),
+                        "ended_at": _iso(group["_ended_ts"]),
+                        "event_count": group["event_count"],
+                        "kinds": sorted(group["kinds"]),
+                        "vitals": run_vitals,
+                        "summary": run_summary,
+                        "_ended_ts": group["_ended_ts"],
+                    }
+                )
+
+            runs.sort(key=lambda run: run["_ended_ts"], reverse=True)
+            trimmed_runs = runs[:limit_sessions]
+            for run in trimmed_runs:
+                run.pop("_ended_ts", None)
+            return trimmed_runs
+
+        measurement_runs: list[dict[str, Any]] = []
+        sensor_vitals: dict[str, Any] = {}
+        sensor_summary: dict[str, Any] = {}
+        if sensor_events:
+            measurement_runs = _group_measurement_runs(sensor_events)
+            measurement_events = [ev for ev in sensor_events if ev.get("measurement_run_id")]
+            analysis_events = measurement_events or sensor_events
+            sensor_vitals, sensor_summary = _summarize_sensor_events(analysis_events)
 
         # Attachments (images) for report context
         cur.execute(
@@ -496,7 +580,7 @@ def build_report_payload(user_id: str, limit_sessions: int, limit_events: int) -
             memory.get("exam") if isinstance(memory, dict) else None,
         )
 
-    return {
+    payload = {
         # Only include the keys the report generator expects to reduce prompt noise.
         "patient_id": user_row[0],
         "name": name,
@@ -515,6 +599,9 @@ def build_report_payload(user_id: str, limit_sessions: int, limit_events: int) -
         # Optional extra context (compact)
         "sensor_summary": sensor_summary,
     }
+    if measurement_runs:
+        payload["measurement_runs"] = measurement_runs
+    return payload
 
 def make_access_token(user_id: str) -> str:
     now = _utcnow()
@@ -620,13 +707,20 @@ class EndSessionReq(BaseModel):
     session_id: str
     ended_at: datetime | None = None
 
+class SensorReadingReq(BaseModel):
+    ts: datetime | None = None
+    seq: int | None = None
+    data: dict[str, Any] = Field(default_factory=dict)
+
 class SensorEventReq(BaseModel):
     device_external_id: str
     session_id: str | None = None
+    measurement_run_id: str | None = None
     ts: datetime | None = None
     kind: str
     seq: int | None = None
-    data: dict = Field(default_factory=dict)
+    data: dict[str, Any] = Field(default_factory=dict)
+    readings: list[SensorReadingReq] = Field(default_factory=list)
 
 class ChatReq(BaseModel):
     user_id: str
@@ -1396,16 +1490,34 @@ def end_session(req: EndSessionReq):
 
 @app.post("/api/sensors/events")
 def sensor_event(req: SensorEventReq):
-    ts = req.ts or datetime.now(timezone.utc)
+    session_id = _validated_uuid_str(req.session_id, "session_id")
+    measurement_run_id = _validated_uuid_str(req.measurement_run_id, "measurement_run_id")
+    fallback_ts = req.ts or datetime.now(timezone.utc)
+    shared_data = dict(req.data or {})
+    readings = req.readings or []
+
+    if readings:
+        events = [
+            {
+                "ts": reading.ts or fallback_ts,
+                "seq": reading.seq,
+                "data": {**shared_data, **(reading.data or {})},
+            }
+            for reading in readings
+        ]
+    else:
+        events = [{"ts": fallback_ts, "seq": req.seq, "data": shared_data}]
 
     logger.info(
-        "sensor_event received device_external_id=%s session_id=%s kind=%s seq=%s ts=%s data_keys=%s",
+        "sensor_event received device_external_id=%s session_id=%s measurement_run_id=%s kind=%s seq=%s ts=%s data_keys=%s readings=%s",
         req.device_external_id,
-        req.session_id,
+        session_id,
+        measurement_run_id,
         req.kind,
         req.seq,
-        ts.isoformat(),
-        len(req.data or {}),
+        req.ts.isoformat() if req.ts else None,
+        len(shared_data),
+        len(events),
     )
 
     try:
@@ -1418,15 +1530,15 @@ def sensor_event(req: SensorEventReq):
                 raise HTTPException(404, {"code": "DEVICE_NOT_REGISTERED", "message": "Device not registered"})
             (device_id,) = row
 
-            if req.session_id:
+            if session_id:
                 cur.execute(
                     "SELECT 1 FROM user_sessions WHERE id=%s AND (device_id=%s OR device_id IS NULL) LIMIT 1;",
-                    (req.session_id, device_id),
+                    (session_id, device_id),
                 )
                 if not cur.fetchone():
                     logger.warning(
                         "sensor_event invalid_session session_id=%s device_id=%s",
-                        req.session_id,
+                        session_id,
                         device_id,
                     )
                     observe_sensor_event(req.kind, "invalid_session")
@@ -1435,25 +1547,40 @@ def sensor_event(req: SensorEventReq):
                         {"code": "INVALID_SESSION", "message": "Invalid session_id for this device"},
                     )
 
-            cur.execute(
-                """
-                INSERT INTO sensor_events (session_id, device_id, ts, kind, seq, data)
-                VALUES (%s, %s, %s, %s, %s, %s::jsonb)
-                ON CONFLICT (device_id, kind, seq) WHERE seq IS NOT NULL DO NOTHING
-                """,
-                (req.session_id, device_id, ts, req.kind, req.seq, _json.dumps(req.data)),
-            )
-            stored = cur.rowcount == 1
-            observe_sensor_event(req.kind, "stored" if stored else "duplicate")
+            stored_count = 0
+            duplicate_count = 0
+
+            for event in events:
+                cur.execute(
+                    """
+                    INSERT INTO sensor_events (session_id, measurement_run_id, device_id, ts, kind, seq, data)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb)
+                    ON CONFLICT (device_id, kind, seq) WHERE seq IS NOT NULL DO NOTHING
+                    """,
+                    (
+                        session_id,
+                        measurement_run_id,
+                        device_id,
+                        event["ts"],
+                        req.kind,
+                        event["seq"],
+                        _json.dumps(event["data"]),
+                    ),
+                )
+                inserted = cur.rowcount == 1
+                stored_count += int(inserted)
+                duplicate_count += int(not inserted)
+                observe_sensor_event(req.kind, "stored" if inserted else "duplicate")
 
     except HTTPException:
         raise
     except psycopg.Error:
         observe_sensor_event(req.kind, "db_error")
         logger.exception(
-            "sensor_event db_error device_external_id=%s session_id=%s kind=%s seq=%s",
+            "sensor_event db_error device_external_id=%s session_id=%s measurement_run_id=%s kind=%s seq=%s",
             req.device_external_id,
-            req.session_id,
+            session_id,
+            measurement_run_id,
             req.kind,
             req.seq,
         )
@@ -1461,33 +1588,68 @@ def sensor_event(req: SensorEventReq):
     except Exception:
         observe_sensor_event(req.kind, "internal_error")
         logger.exception(
-            "sensor_event unexpected_error device_external_id=%s session_id=%s kind=%s seq=%s",
+            "sensor_event unexpected_error device_external_id=%s session_id=%s measurement_run_id=%s kind=%s seq=%s",
             req.device_external_id,
-            req.session_id,
+            session_id,
+            measurement_run_id,
             req.kind,
             req.seq,
         )
         raise HTTPException(500, {"code": "INTERNAL_ERROR", "message": "Internal server error"})
 
-    return {"ok": True, "stored": stored}
+    if len(events) == 1:
+        return {"ok": True, "stored": stored_count == 1}
+
+    return {
+        "ok": True,
+        "received": len(events),
+        "stored": stored_count,
+        "duplicates": duplicate_count,
+    }
 
 @app.get("/api/sensors/last")
-def last(device_external_id: str, kind: str, n: int = Query(10, ge=1, le=100)):
+def last(
+    device_external_id: str,
+    kind: str,
+    n: int = Query(10, ge=1, le=100),
+    session_id: str | None = None,
+    measurement_run_id: str | None = None,
+):
+    session_id = _validated_uuid_str(session_id, "session_id")
+    measurement_run_id = _validated_uuid_str(measurement_run_id, "measurement_run_id")
+    where = [
+        "device_id = (SELECT id FROM devices WHERE device_external_id=%s)",
+        "kind = %s",
+    ]
+    params: list[Any] = [device_external_id, kind]
+
+    if session_id:
+        where.append("session_id = %s")
+        params.append(session_id)
+
+    if measurement_run_id:
+        where.append("measurement_run_id = %s")
+        params.append(measurement_run_id)
+
+    params.append(n)
+
     with db() as conn, conn.cursor() as cur:
         cur.execute(
-            """
-            SELECT ts, seq, data
+            f"""
+            SELECT ts, seq, data, measurement_run_id::text
             FROM sensor_events
-            WHERE device_id = (SELECT id FROM devices WHERE device_external_id=%s)
-              AND kind = %s
+            WHERE {' AND '.join(where)}
             ORDER BY ts DESC
             LIMIT %s
             """,
-            (device_external_id, kind, n),
+            params,
         )
         rows = cur.fetchall()
 
-    return [{"ts": r[0].isoformat(), "seq": r[1], "data": r[2]} for r in rows]
+    return [
+        {"ts": r[0].isoformat(), "seq": r[1], "data": r[2], "measurement_run_id": r[3]}
+        for r in rows
+    ]
 
 class ImgRow(BaseModel):
     id: int

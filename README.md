@@ -74,8 +74,33 @@ Below is a practical, human‑readable map of the API routes in `api/app.py` and
 | `POST` | `/api/devices/register` | Registers or updates a device and its capabilities. | Upserts on `device_external_id`. |
 | `POST` | `/api/sessions/start` | Starts a new user session for a device. | Returns `{session_id, device_id}`. |
 | `POST` | `/api/sessions/end` | Ends a session (idempotent). | Validates `ended_at` vs `started_at`. |
-| `POST` | `/api/sensors/events` | Ingests a sensor event payload. | De‑dupes on `(device_id, kind, seq)`. |
-| `GET` | `/api/sensors/last` | Gets last `n` sensor events by device and kind. | Query params: `device_external_id`, `kind`, `n`. |
+| `POST` | `/api/sensors/events` | Ingests one sensor event or a batched list of timestamped readings for one sensor kind. | `session_id` remains the device/session key; optional `measurement_run_id` groups user-triggered measurement flows; de‑dupes on `(device_id, kind, seq)` when `seq` is present. |
+| `GET` | `/api/sensors/last` | Gets last `n` sensor events by device and kind. | Query params: `device_external_id`, `kind`, `n`, optional `session_id`, optional `measurement_run_id`. |
+
+Example batched sensor payload:
+
+```json
+{
+  "device_external_id": "watch-123",
+  "session_id": "2b4d8ff5-2b0b-4e7e-8f8f-8f52f8d51fd1",
+  "measurement_run_id": "4f6f5ff0-d01f-4536-a8b3-a59e9e8de9d3",
+  "kind": "hr",
+  "readings": [
+    {
+      "ts": "2026-03-13T15:00:00Z",
+      "seq": 101,
+      "data": { "value": 78 }
+    },
+    {
+      "ts": "2026-03-13T15:00:03Z",
+      "seq": 102,
+      "data": { "value": 80 }
+    }
+  ]
+}
+```
+
+Send heart rate and SpO2 as separate requests by `kind` such as `hr` and `spo2`. Reuse the same `measurement_run_id` across all user-triggered uploads in one measurement flow, and omit `measurement_run_id` for background ambient uploads.
 
 ### Files, Images, and Storage
 
