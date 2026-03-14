@@ -72,10 +72,12 @@ Below is a practical, human‑readable map of the API routes in `api/app.py` and
 | Method | Path | What it does | Notes |
 | --- | --- | --- | --- |
 | `POST` | `/api/devices/register` | Registers or updates a device and its capabilities. | Upserts on `device_external_id`. |
-| `POST` | `/api/sessions/start` | Starts a new user session for a device. | Returns `{session_id, device_id}`. |
+| `POST` | `/api/sessions/start` | Starts a new user session for a device. | Accepts optional `encounter_id`; returns `{session_id, device_id, encounter_id}`. |
 | `POST` | `/api/sessions/end` | Ends a session (idempotent). | Validates `ended_at` vs `started_at`. |
-| `POST` | `/api/sensors/events` | Ingests one sensor event or a batched list of timestamped readings for one sensor kind. | `session_id` remains the device/session key; optional `measurement_run_id` groups user-triggered measurement flows; de‑dupes on `(device_id, kind, seq)` when `seq` is present. |
+| `POST` | `/api/sensors/events` | Ingests one sensor event or a batched list of timestamped readings for one sensor kind. | Optional `encounter_id` keeps chat, session, and sensor history joined; `measurement_run_id` groups user-triggered measurement flows; de‑dupes on `(device_id, kind, seq)` when `seq` is present. |
 | `GET` | `/api/sensors/last` | Gets last `n` sensor events by device and kind. | Query params: `device_external_id`, `kind`, `n`, optional `session_id`, optional `measurement_run_id`. |
+| `GET` | `/api/measurements/history` | Returns one joined history item per encounter/session. | Requires access token; supports `user_id` and `limit` query params. |
+| `GET` | `/api/measurements/trends` | Returns chart-ready grouped vital series. | Requires access token; supports optional `user_id` query param. |
 
 Example batched sensor payload:
 
@@ -114,7 +116,7 @@ Send heart rate and SpO2 as separate requests by `kind` such as `hr` and `spo2`.
 
 | Method | Path | What it does | Notes |
 | --- | --- | --- | --- |
-| `POST` | `/api/chat` | Runs a chat turn using RAG, stores user/assistant messages, and updates session signals. | Creates a session if missing; uses `rag_conv.rag_agent.chat_once`. |
+| `POST` | `/api/chat` | Runs a chat turn using RAG, stores user/assistant messages, and updates session signals. | Creates or reuses a chat session; accepts optional `encounter_id` and returns both `session_id` and `encounter_id`. |
 
 ## Quick Start
 

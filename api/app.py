@@ -175,6 +175,13 @@ def _utcnow():
 def _iso(dt: datetime | None) -> str | None:
     return dt.isoformat() if dt else None
 
+def _iso_utc(dt: datetime | None) -> str | None:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
 def _validated_uuid_str(value: str | None, field_name: str) -> str | None:
     if not value:
         return None
@@ -182,6 +189,208 @@ def _validated_uuid_str(value: str | None, field_name: str) -> str | None:
         return str(uuid.UUID(value))
     except ValueError as exc:
         raise HTTPException(400, f"{field_name} must be a UUID") from exc
+
+def _coalesce_nonempty(*vals):
+    for v in vals:
+        if v is None:
+            continue
+        if isinstance(v, str) and not v.strip():
+            continue
+        if isinstance(v, (list, dict, tuple, set)) and len(v) == 0:
+            continue
+        return v
+    return None
+
+def _as_number(v):
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    if isinstance(v, str):
+        try:
+            return float(v)
+        except ValueError:
+            return None
+    return None
+
+def _extract_from_data(data: dict[str, Any], keys: list[str]):
+    if not isinstance(data, dict):
+        return None
+    for k in keys:
+        if k in data:
+            n = _as_number(data.get(k))
+            if n is not None:
+                return n
+    return None
+
+def _latest_measurement(events: list[dict[str, Any]], kinds: set[str], keys: list[str]):
+    for ev in events:
+        if ev.get("kind") in kinds:
+            n = _extract_from_data(ev.get("data") or {}, keys)
+            if n is not None:
+                return n
+        n = _extract_from_data(ev.get("data") or {}, keys)
+        if n is not None:
+            return n
+    return None
+
+def _latest_bp(events: list[dict[str, Any]]):
+    for ev in events:
+        data = ev.get("data") or {}
+        if not isinstance(data, dict):
+            continue
+        if "bp" in data and isinstance(data.get("bp"), str):
+            return data.get("bp")
+        sys = _extract_from_data(data, ["systolic", "sys", "bp_systolic"])
+        dia = _extract_from_data(data, ["diastolic", "dia", "bp_diastolic"])
+        if sys is not None and dia is not None:
+            return f"{int(sys)}/{int(dia)}"
+    return None
+
+def _string_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    if not isinstance(value, list):
+        return []
+    return [item.strip() for item in value if isinstance(item, str) and item.strip()]
+
+def _extract_feelings(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    if isinstance(value, list):
+        return [item.strip() for item in value if isinstance(item, str) and item.strip()]
+    if isinstance(value, dict):
+        nested = _extract_feelings(value.get("feelings"))
+        if nested:
+            return nested
+        feelings: list[str] = []
+        for key, raw in value.items():
+            if not isinstance(key, str) or not key.strip():
+                continue
+            include = False
+            if isinstance(raw, bool):
+                include = raw
+            elif isinstance(raw, (int, float)):
+                include = raw > 0
+            elif isinstance(raw, str):
+                include = bool(raw.strip())
+            elif raw is not None:
+                include = True
+            if include:
+                feelings.append(key.strip())
+        return feelings
+    return []
+
+def _history_chat_result_from_meta(meta: dict[str, Any] | None, fallback_text: str | None = None) -> dict[str, Any] | None:
+    if not isinstance(meta, dict):
+        meta = {}
+
+    assistant_summary = _coalesce_nonempty(
+        meta.get("assistant_summary"),
+        meta.get("last_assistant_summary"),
+        meta.get("assistant_message"),
+        meta.get("last_assistant_message"),
+        fallback_text,
+    )
+    suggested_next_step = _coalesce_nonempty(
+        meta.get("suggested_next_step"),
+        meta.get("last_suggested_next_step"),
+    )
+    recommended_sensor = _coalesce_nonempty(
+        meta.get("recommended_sensor"),
+        meta.get("last_recommended_sensor"),
+    )
+    sensor_confidence = _as_number(meta.get("sensor_confidence"))
+    if sensor_confidence is None:
+        sensor_confidence = _as_number(meta.get("last_sensor_confidence"))
+
+    recommended_measurements = _string_list(meta.get("recommended_measurements"))
+    if not recommended_measurements:
+        recommended_measurements = _string_list(meta.get("last_recommended_measurements"))
+
+    if (
+        assistant_summary is None
+        and suggested_next_step is None
+        and recommended_sensor is None
+        and sensor_confidence is None
+        and not recommended_measurements
+    ):
+        return None
+
+    return {
+        "assistant_summary": assistant_summary,
+        "suggested_next_step": suggested_next_step,
+        "recommended_sensor": recommended_sensor,
+        "sensor_confidence": sensor_confidence,
+        "recommended_measurements": recommended_measurements,
+    }
+
+TREND_SERIES_SPECS: dict[str, dict[str, Any]] = {
+    "temperature": {
+        "label": "Temperature",
+        "unit": "C",
+        "sensor_kinds": {"temp", "temperature", "body_temp", "skin_temperature", "skin_temp"},
+        "data_keys": ["skin_temperature_c", "skin_temperature", "skin_temp", "temperature", "temp", "celsius", "value"],
+        "specific_keys": ["skin_temperature_c", "skin_temperature", "skin_temp", "temperature", "temp", "celsius"],
+        "min_allowed": 1.0,
+        "max_allowed": 60.0,
+    },
+    "spo2": {
+        "label": "SpO2",
+        "unit": "%",
+        "normal_range": {"min": 95.0, "max": 100.0},
+        "sensor_kinds": {"spo2", "pulse_ox", "pulse_oxygen", "oxygen"},
+        "data_keys": ["spo2_percent", "spo2", "oxygen_saturation", "oxygen", "o2", "value"],
+        "specific_keys": ["spo2_percent", "spo2", "oxygen_saturation", "oxygen", "o2"],
+        "min_allowed": 1.0,
+        "max_allowed": 100.0,
+    },
+    "heart_rate": {
+        "label": "Heart Rate",
+        "unit": "bpm",
+        "normal_range": {"min": 60.0, "max": 100.0},
+        "sensor_kinds": {"hr", "heart_rate", "pulse"},
+        "data_keys": ["heart_rate_bpm", "heart_rate", "hr", "pulse", "bpm", "value"],
+        "specific_keys": ["heart_rate_bpm", "heart_rate", "hr", "pulse", "bpm"],
+        "min_allowed": 1.0,
+    },
+    "humidity": {
+        "label": "Humidity",
+        "unit": "%",
+        "sensor_kinds": {"humidity", "humid"},
+        "data_keys": ["humidity_percent", "humidity", "relative_humidity", "rh", "value"],
+        "specific_keys": ["humidity_percent", "humidity", "relative_humidity", "rh"],
+        "min_allowed": 0.0,
+        "max_allowed": 100.0,
+    },
+    "co2": {
+        "label": "CO2",
+        "unit": "ppm",
+        "sensor_kinds": {"co2"},
+        "data_keys": ["co2_ppm", "co2", "ppm", "value"],
+        "specific_keys": ["co2_ppm", "co2", "ppm"],
+        "min_allowed": 0.0,
+    },
+}
+
+def _extract_trend_value(raw_kind: str | None, data: dict[str, Any], spec: dict[str, Any]) -> float | None:
+    if not isinstance(data, dict):
+        return None
+
+    if raw_kind in spec["sensor_kinds"]:
+        value = _extract_from_data(data, spec["data_keys"])
+    else:
+        value = _extract_from_data(data, spec["specific_keys"])
+
+    if value is None:
+        return None
+    min_allowed = spec.get("min_allowed")
+    max_allowed = spec.get("max_allowed")
+    if min_allowed is not None and value < min_allowed:
+        return None
+    if max_allowed is not None and value > max_allowed:
+        return None
+    return value
 
 def build_report_payload(user_id: str, limit_sessions: int, limit_events: int) -> dict[str, Any]:
     # Build a compact payload for report generation.
@@ -698,10 +907,12 @@ class StartSessionReq(BaseModel):
     user_id: str
     device_external_id: str
     meta: dict = Field(default_factory=dict)
+    encounter_id: str | None = None
 
 class StartSessionResp(BaseModel):
     session_id: str
     device_id: str
+    encounter_id: str
 
 class EndSessionReq(BaseModel):
     session_id: str
@@ -716,6 +927,7 @@ class SensorEventReq(BaseModel):
     device_external_id: str
     session_id: str | None = None
     measurement_run_id: str | None = None
+    encounter_id: str | None = None
     ts: datetime | None = None
     kind: str
     seq: int | None = None
@@ -726,6 +938,7 @@ class ChatReq(BaseModel):
     user_id: str
     message: str
     session_id: str | None = None
+    encounter_id: str | None = None
 
 class MobileExchangeReq(BaseModel):
     code: str
@@ -763,6 +976,62 @@ class ReportListItem(BaseModel):
 
 class ReportDetail(ReportListItem):
     report_md: str
+
+class MeasurementHistoryMessage(BaseModel):
+    role: str
+    text: str
+    created_at: str
+
+class MeasurementHistoryChatResult(BaseModel):
+    assistant_summary: str | None = None
+    suggested_next_step: str | None = None
+    recommended_sensor: str | None = None
+    sensor_confidence: float | None = None
+    recommended_measurements: list[str] = Field(default_factory=list)
+
+class MeasurementHistorySummary(BaseModel):
+    skin_temperature_c: float | None = None
+    spo2_percent: float | None = None
+    heart_rate_bpm: float | None = None
+    humidity_percent: float | None = None
+    co2_ppm: float | None = None
+
+class MeasurementHistorySession(BaseModel):
+    encounter_id: str
+    user_id: str
+    chat_session_id: str | None = None
+    measurement_session_id: str | None = None
+    measurement_run_ids: list[str] = Field(default_factory=list)
+    started_at: str | None = None
+    ended_at: str | None = None
+    device_name: str | None = None
+    feelings: list[str] = Field(default_factory=list)
+    notes: str | None = None
+    chat_result: MeasurementHistoryChatResult | None = None
+    messages: list[MeasurementHistoryMessage] = Field(default_factory=list)
+    summary: MeasurementHistorySummary = Field(default_factory=MeasurementHistorySummary)
+
+class MeasurementHistoryResp(BaseModel):
+    sessions: list[MeasurementHistorySession] = Field(default_factory=list)
+
+class MeasurementTrendNormalRange(BaseModel):
+    min: float
+    max: float
+
+class MeasurementTrendPoint(BaseModel):
+    ts: str
+    value: float
+    encounter_id: str | None = None
+
+class MeasurementTrendSeries(BaseModel):
+    kind: str
+    label: str | None = None
+    unit: str | None = None
+    normal_range: MeasurementTrendNormalRange | None = None
+    points: list[MeasurementTrendPoint] = Field(default_factory=list)
+
+class MeasurementTrendsResp(BaseModel):
+    series: list[MeasurementTrendSeries] = Field(default_factory=list)
 
 def auth_device(authorization: Optional[str], device_id: str):
     if not authorization or not authorization.startswith("Bearer "):
@@ -1174,6 +1443,425 @@ def require_access_user_id(creds: HTTPAuthorizationCredentials = Depends(bearer)
 
     return payload["sub"]
 
+def build_measurement_history(user_id: str, limit: int) -> dict[str, Any]:
+    try:
+        validated_user_id = str(uuid.UUID(user_id))
+    except ValueError as exc:
+        raise HTTPException(400, "user_id must be a valid UUID") from exc
+
+    with db() as conn, conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM users WHERE id=%s LIMIT 1;", (validated_user_id,))
+        if not cur.fetchone():
+            raise HTTPException(404, "User not found")
+
+        cur.execute(
+            """
+            SELECT us.id::text,
+                   COALESCE(us.encounter_id, us.id)::text,
+                   us.started_at,
+                   us.ended_at,
+                   us.meta,
+                   d.device_external_id
+            FROM user_sessions us
+            LEFT JOIN devices d ON d.id = us.device_id
+            WHERE us.user_id = %s
+            ORDER BY us.started_at ASC, us.id ASC
+            """,
+            (validated_user_id,),
+        )
+        session_rows = cur.fetchall()
+
+        cur.execute(
+            """
+            SELECT sm.session_id::text,
+                   COALESCE(us.encounter_id, us.id)::text,
+                   sm.role,
+                   sm.content,
+                   sm.ts,
+                   sm.meta
+            FROM session_messages sm
+            JOIN user_sessions us ON us.id = sm.session_id
+            WHERE us.user_id = %s
+            ORDER BY sm.ts ASC, sm.id ASC
+            """,
+            (validated_user_id,),
+        )
+        message_rows = cur.fetchall()
+
+        cur.execute(
+            """
+            SELECT sem.session_id::text,
+                   COALESCE(us.encounter_id, us.id)::text,
+                   sem.ts,
+                   sem.emotions
+            FROM session_emotions sem
+            JOIN user_sessions us ON us.id = sem.session_id
+            WHERE us.user_id = %s
+            ORDER BY sem.ts ASC, sem.id ASC
+            """,
+            (validated_user_id,),
+        )
+        emotion_rows = cur.fetchall()
+
+        cur.execute(
+            """
+            SELECT se.id,
+                   COALESCE(se.encounter_id, us.encounter_id, us.id)::text,
+                   se.session_id::text,
+                   se.measurement_run_id::text,
+                   se.ts,
+                   se.kind,
+                   se.seq,
+                   se.data,
+                   d.device_external_id
+            FROM sensor_events se
+            LEFT JOIN user_sessions us ON us.id = se.session_id
+            LEFT JOIN devices d ON d.id = se.device_id
+            WHERE (
+                us.user_id = %s
+                OR (
+                    se.session_id IS NULL
+                    AND se.encounter_id IS NOT NULL
+                    AND EXISTS (
+                        SELECT 1
+                        FROM user_sessions ux
+                        WHERE ux.user_id = %s
+                          AND ux.encounter_id = se.encounter_id
+                    )
+                )
+            )
+            ORDER BY se.ts ASC, se.id ASC
+            """,
+            (validated_user_id, validated_user_id),
+        )
+        sensor_rows = cur.fetchall()
+
+    encounters: dict[str, dict[str, Any]] = {}
+    session_index: dict[str, dict[str, Any]] = {}
+    min_dt = datetime.min.replace(tzinfo=timezone.utc)
+
+    def ensure_encounter(encounter_id: str) -> dict[str, Any]:
+        encounter = encounters.get(encounter_id)
+        if encounter is not None:
+            return encounter
+
+        encounter = {
+            "encounter_id": encounter_id,
+            "user_id": validated_user_id,
+            "chat_session_id": None,
+            "measurement_session_id": None,
+            "measurement_run_ids": [],
+            "started_at": None,
+            "ended_at": None,
+            "device_name": None,
+            "feelings": [],
+            "notes": None,
+            "chat_result": None,
+            "messages": [],
+            "summary": {},
+            "_started_dt": None,
+            "_ended_dt": None,
+            "_measurement_run_seen": set(),
+            "_feelings_seen": set(),
+            "_chat_result_ts": None,
+            "_sensor_events": [],
+            "_sessions": [],
+        }
+        encounters[encounter_id] = encounter
+        return encounter
+
+    def touch(encounter: dict[str, Any], ts: datetime | None) -> None:
+        if ts is None:
+            return
+        if encounter["_started_dt"] is None or ts < encounter["_started_dt"]:
+            encounter["_started_dt"] = ts
+        if encounter["_ended_dt"] is None or ts > encounter["_ended_dt"]:
+            encounter["_ended_dt"] = ts
+
+    def add_feelings(encounter: dict[str, Any], raw: Any) -> None:
+        for feeling in _extract_feelings(raw):
+            if feeling in encounter["_feelings_seen"]:
+                continue
+            encounter["_feelings_seen"].add(feeling)
+            encounter["feelings"].append(feeling)
+
+    for session_id, encounter_id, started_at, ended_at, meta, device_name in session_rows:
+        encounter = ensure_encounter(encounter_id)
+        touch(encounter, started_at)
+        touch(encounter, ended_at or started_at)
+
+        meta = meta if isinstance(meta, dict) else {}
+        if not encounter["device_name"] and device_name:
+            encounter["device_name"] = device_name
+
+        note = _coalesce_nonempty(meta.get("notes"), meta.get("note"))
+        if note is not None and encounter["notes"] is None:
+            encounter["notes"] = note
+
+        add_feelings(encounter, meta.get("feelings"))
+
+        session_info = {
+            "session_id": session_id,
+            "source": meta.get("source") if isinstance(meta.get("source"), str) else None,
+            "started_at": started_at,
+            "ended_at": ended_at,
+            "device_name": device_name,
+            "meta": meta,
+            "has_messages": False,
+            "has_sensor_events": False,
+            "last_message_ts": None,
+            "last_sensor_ts": None,
+        }
+        session_index[session_id] = session_info
+        encounter["_sessions"].append(session_info)
+
+        session_chat_result = _history_chat_result_from_meta(meta)
+        candidate_ts = ended_at or started_at
+        if session_chat_result is not None and (
+            encounter["_chat_result_ts"] is None
+            or (candidate_ts is not None and candidate_ts >= encounter["_chat_result_ts"])
+        ):
+            encounter["chat_result"] = session_chat_result
+            encounter["_chat_result_ts"] = candidate_ts
+
+    for session_id, encounter_id, role, content, created_at, meta in message_rows:
+        encounter = ensure_encounter(encounter_id)
+        touch(encounter, created_at)
+        encounter["messages"].append(
+            {
+                "role": role,
+                "text": content,
+                "created_at": _iso(created_at),
+            }
+        )
+
+        session_info = session_index.get(session_id)
+        if session_info is not None:
+            session_info["has_messages"] = True
+            if session_info["last_message_ts"] is None or created_at > session_info["last_message_ts"]:
+                session_info["last_message_ts"] = created_at
+
+        if role == "assistant":
+            message_chat_result = _history_chat_result_from_meta(meta, fallback_text=content)
+            if message_chat_result is not None and (
+                encounter["_chat_result_ts"] is None or created_at >= encounter["_chat_result_ts"]
+            ):
+                encounter["chat_result"] = message_chat_result
+                encounter["_chat_result_ts"] = created_at
+
+    for session_id, encounter_id, created_at, emotions in emotion_rows:
+        encounter = ensure_encounter(encounter_id)
+        touch(encounter, created_at)
+        add_feelings(encounter, emotions)
+
+        session_info = session_index.get(session_id)
+        if session_info is not None and session_info["last_message_ts"] is None:
+            session_info["last_message_ts"] = created_at
+
+    for _, encounter_id, session_id, measurement_run_id, created_at, kind, seq, data, device_name in sensor_rows:
+        encounter = ensure_encounter(encounter_id)
+        touch(encounter, created_at)
+
+        if measurement_run_id and measurement_run_id not in encounter["_measurement_run_seen"]:
+            encounter["_measurement_run_seen"].add(measurement_run_id)
+            encounter["measurement_run_ids"].append(measurement_run_id)
+
+        if not encounter["device_name"] and device_name:
+            encounter["device_name"] = device_name
+
+        session_info = session_index.get(session_id) if session_id else None
+        if session_info is not None:
+            session_info["has_sensor_events"] = True
+            if session_info["last_sensor_ts"] is None or created_at > session_info["last_sensor_ts"]:
+                session_info["last_sensor_ts"] = created_at
+
+        encounter["_sensor_events"].append(
+            {
+                "ts": _iso(created_at),
+                "_ts": created_at,
+                "kind": kind,
+                "seq": seq,
+                "data": data or {},
+            }
+        )
+
+    sessions: list[dict[str, Any]] = []
+
+    def session_sort_key(session_info: dict[str, Any]) -> datetime:
+        return (
+            session_info.get("last_sensor_ts")
+            or session_info.get("last_message_ts")
+            or session_info.get("ended_at")
+            or session_info.get("started_at")
+            or min_dt
+        )
+
+    for encounter in encounters.values():
+        encounter["started_at"] = _iso(encounter["_started_dt"])
+        encounter["ended_at"] = _iso(encounter["_ended_dt"])
+        encounter["_sort_dt"] = encounter["_ended_dt"] or encounter["_started_dt"] or min_dt
+
+        chat_candidates = [
+            session_info
+            for session_info in encounter["_sessions"]
+            if session_info.get("has_messages") or session_info.get("source") == "api_chat"
+        ]
+        chat_candidates.sort(key=session_sort_key, reverse=True)
+        if chat_candidates:
+            encounter["chat_session_id"] = chat_candidates[0]["session_id"]
+            if encounter["chat_result"] is None:
+                fallback_chat_result = _history_chat_result_from_meta(chat_candidates[0].get("meta"))
+                if fallback_chat_result is not None:
+                    encounter["chat_result"] = fallback_chat_result
+
+        measurement_candidates = [
+            session_info
+            for session_info in encounter["_sessions"]
+            if session_info.get("has_sensor_events") or session_info.get("device_name")
+        ]
+        measurement_candidates.sort(key=session_sort_key, reverse=True)
+        if measurement_candidates:
+            encounter["measurement_session_id"] = measurement_candidates[0]["session_id"]
+            if encounter["device_name"] is None:
+                encounter["device_name"] = measurement_candidates[0].get("device_name")
+
+        ordered_events = sorted(
+            encounter["_sensor_events"],
+            key=lambda ev: ev.get("_ts") or min_dt,
+            reverse=True,
+        )
+        summary: dict[str, Any] = {}
+        skin_temp = _latest_measurement(
+            ordered_events,
+            {"skin_temperature", "skin_temp", "temp", "temperature", "body_temp"},
+            ["skin_temperature_c", "skin_temperature", "skin_temp", "temperature", "temp", "celsius", "value"],
+        )
+        spo2 = _latest_measurement(
+            ordered_events,
+            {"spo2", "pulse_ox", "pulse_oxygen", "oxygen"},
+            ["spo2_percent", "spo2", "oxygen_saturation", "oxygen", "o2", "value"],
+        )
+        heart_rate = _latest_measurement(
+            ordered_events,
+            {"hr", "heart_rate", "pulse"},
+            ["heart_rate_bpm", "heart_rate", "hr", "pulse", "bpm", "value"],
+        )
+        humidity = _latest_measurement(
+            ordered_events,
+            {"humidity", "humid"},
+            ["humidity_percent", "humidity", "relative_humidity", "rh", "value"],
+        )
+        co2 = _latest_measurement(
+            ordered_events,
+            {"co2"},
+            ["co2_ppm", "co2", "ppm", "value"],
+        )
+
+        if skin_temp is not None:
+            summary["skin_temperature_c"] = skin_temp
+        if spo2 is not None:
+            summary["spo2_percent"] = spo2
+        if heart_rate is not None:
+            summary["heart_rate_bpm"] = heart_rate
+        if humidity is not None:
+            summary["humidity_percent"] = humidity
+        if co2 is not None:
+            summary["co2_ppm"] = co2
+        encounter["summary"] = summary
+
+        encounter.pop("_started_dt", None)
+        encounter.pop("_ended_dt", None)
+        encounter.pop("_measurement_run_seen", None)
+        encounter.pop("_feelings_seen", None)
+        encounter.pop("_chat_result_ts", None)
+        encounter.pop("_sensor_events", None)
+        encounter.pop("_sessions", None)
+
+        sessions.append(encounter)
+
+    sessions.sort(
+        key=lambda encounter: (
+            encounter.get("_sort_dt") or min_dt,
+            encounter.get("started_at") or "",
+        ),
+        reverse=True,
+    )
+    for encounter in sessions:
+        encounter.pop("_sort_dt", None)
+    return {"sessions": sessions[:limit]}
+
+def build_measurement_trends(user_id: str) -> dict[str, Any]:
+    try:
+        validated_user_id = str(uuid.UUID(user_id))
+    except ValueError as exc:
+        raise HTTPException(400, "user_id must be a valid UUID") from exc
+
+    with db() as conn, conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM users WHERE id=%s LIMIT 1;", (validated_user_id,))
+        if not cur.fetchone():
+            raise HTTPException(404, "User not found")
+
+        cur.execute(
+            """
+            SELECT COALESCE(se.encounter_id, us.encounter_id, us.id)::text,
+                   se.ts,
+                   se.kind,
+                   se.data
+            FROM sensor_events se
+            LEFT JOIN user_sessions us ON us.id = se.session_id
+            WHERE (
+                us.user_id = %s
+                OR (
+                    se.session_id IS NULL
+                    AND se.encounter_id IS NOT NULL
+                    AND EXISTS (
+                        SELECT 1
+                        FROM user_sessions ux
+                        WHERE ux.user_id = %s
+                          AND ux.encounter_id = se.encounter_id
+                    )
+                )
+            )
+            ORDER BY se.ts ASC, se.id ASC
+            """,
+            (validated_user_id, validated_user_id),
+        )
+        rows = cur.fetchall()
+
+    series_by_kind: dict[str, dict[str, Any]] = {}
+    for encounter_id, ts, raw_kind, data in rows:
+        payload = data if isinstance(data, dict) else {}
+        for trend_kind, spec in TREND_SERIES_SPECS.items():
+            value = _extract_trend_value(raw_kind, payload, spec)
+            if value is None:
+                continue
+
+            series = series_by_kind.setdefault(
+                trend_kind,
+                {
+                    "kind": trend_kind,
+                    "label": spec.get("label"),
+                    "unit": spec.get("unit"),
+                    "normal_range": spec.get("normal_range"),
+                    "points": [],
+                },
+            )
+            series["points"].append(
+                {
+                    "ts": _iso_utc(ts),
+                    "value": value,
+                    "encounter_id": encounter_id,
+                }
+            )
+
+    return {
+        "series": [
+            series_by_kind[kind]
+            for kind in TREND_SERIES_SPECS
+            if kind in series_by_kind and series_by_kind[kind]["points"]
+        ]
+    }
+
 @app.get("/auth/me")
 def auth_me(user_id: str = Depends(require_access_user_id)):
     return {"user_id": user_id}
@@ -1417,7 +2105,27 @@ def register_device(req: DeviceRegisterReq):
 
 @app.post("/api/sessions/start", response_model=StartSessionResp)
 def start_session(req: StartSessionReq):
+    encounter_id = _validated_uuid_str(req.encounter_id, "encounter_id") or str(uuid.uuid4())
+    session_meta = dict(req.meta or {})
+    session_meta.setdefault("source", "api_sessions_start")
+
     with db() as conn, conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM users WHERE id=%s LIMIT 1;", (req.user_id,))
+        if not cur.fetchone():
+            raise HTTPException(404, "User not found")
+
+        cur.execute(
+            """
+            SELECT 1
+            FROM user_sessions
+            WHERE encounter_id = %s AND user_id <> %s
+            LIMIT 1
+            """,
+            (encounter_id, req.user_id),
+        )
+        if cur.fetchone():
+            raise HTTPException(400, "encounter_id belongs to another user")
+
         # lookup device_id by external id
         cur.execute(
             "SELECT id::text FROM devices WHERE device_external_id=%s;",
@@ -1430,15 +2138,15 @@ def start_session(req: StartSessionReq):
 
         cur.execute(
             """
-            INSERT INTO user_sessions (user_id, device_id, started_at, meta)
-            VALUES (%s, %s, now(), %s::jsonb)
+            INSERT INTO user_sessions (user_id, device_id, started_at, meta, encounter_id)
+            VALUES (%s, %s, now(), %s::jsonb, %s)
             RETURNING id::text;
             """,
-            (req.user_id, device_id, _json.dumps(req.meta)),
+            (req.user_id, device_id, _json.dumps(session_meta), encounter_id),
         )
         (session_id,) = cur.fetchone()
 
-    return {"session_id": session_id, "device_id": device_id}
+    return {"session_id": session_id, "device_id": device_id, "encounter_id": encounter_id}
 
 @app.post("/api/sessions/end")
 def end_session(req: EndSessionReq):
@@ -1492,6 +2200,7 @@ def end_session(req: EndSessionReq):
 def sensor_event(req: SensorEventReq):
     session_id = _validated_uuid_str(req.session_id, "session_id")
     measurement_run_id = _validated_uuid_str(req.measurement_run_id, "measurement_run_id")
+    encounter_id = _validated_uuid_str(req.encounter_id, "encounter_id")
     fallback_ts = req.ts or datetime.now(timezone.utc)
     shared_data = dict(req.data or {})
     readings = req.readings or []
@@ -1509,9 +2218,10 @@ def sensor_event(req: SensorEventReq):
         events = [{"ts": fallback_ts, "seq": req.seq, "data": shared_data}]
 
     logger.info(
-        "sensor_event received device_external_id=%s session_id=%s measurement_run_id=%s kind=%s seq=%s ts=%s data_keys=%s readings=%s",
+        "sensor_event received device_external_id=%s session_id=%s encounter_id=%s measurement_run_id=%s kind=%s seq=%s ts=%s data_keys=%s readings=%s",
         req.device_external_id,
         session_id,
+        encounter_id,
         measurement_run_id,
         req.kind,
         req.seq,
@@ -1530,12 +2240,19 @@ def sensor_event(req: SensorEventReq):
                 raise HTTPException(404, {"code": "DEVICE_NOT_REGISTERED", "message": "Device not registered"})
             (device_id,) = row
 
+            resolved_encounter_id = encounter_id
             if session_id:
                 cur.execute(
-                    "SELECT 1 FROM user_sessions WHERE id=%s AND (device_id=%s OR device_id IS NULL) LIMIT 1;",
+                    """
+                    SELECT COALESCE(encounter_id, id)::text
+                    FROM user_sessions
+                    WHERE id=%s AND (device_id=%s OR device_id IS NULL)
+                    LIMIT 1;
+                    """,
                     (session_id, device_id),
                 )
-                if not cur.fetchone():
+                row = cur.fetchone()
+                if not row:
                     logger.warning(
                         "sensor_event invalid_session session_id=%s device_id=%s",
                         session_id,
@@ -1546,6 +2263,41 @@ def sensor_event(req: SensorEventReq):
                         400,
                         {"code": "INVALID_SESSION", "message": "Invalid session_id for this device"},
                     )
+                session_encounter_id = row[0]
+                if resolved_encounter_id and session_encounter_id and resolved_encounter_id != session_encounter_id:
+                    logger.warning(
+                        "sensor_event invalid_encounter session_id=%s encounter_id=%s expected_encounter_id=%s",
+                        session_id,
+                        resolved_encounter_id,
+                        session_encounter_id,
+                    )
+                    observe_sensor_event(req.kind, "invalid_encounter")
+                    raise HTTPException(
+                        400,
+                        {"code": "INVALID_ENCOUNTER", "message": "encounter_id does not match session_id"},
+                    )
+                resolved_encounter_id = session_encounter_id or resolved_encounter_id
+            elif resolved_encounter_id:
+                cur.execute(
+                    """
+                    SELECT 1
+                    FROM user_sessions
+                    WHERE encounter_id=%s AND (device_id=%s OR device_id IS NULL)
+                    LIMIT 1;
+                    """,
+                    (resolved_encounter_id, device_id),
+                )
+                if not cur.fetchone():
+                    logger.warning(
+                        "sensor_event invalid_encounter encounter_id=%s device_id=%s",
+                        resolved_encounter_id,
+                        device_id,
+                    )
+                    observe_sensor_event(req.kind, "invalid_encounter")
+                    raise HTTPException(
+                        400,
+                        {"code": "INVALID_ENCOUNTER", "message": "Invalid encounter_id for this device"},
+                    )
 
             stored_count = 0
             duplicate_count = 0
@@ -1553,13 +2305,14 @@ def sensor_event(req: SensorEventReq):
             for event in events:
                 cur.execute(
                     """
-                    INSERT INTO sensor_events (session_id, measurement_run_id, device_id, ts, kind, seq, data)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb)
+                    INSERT INTO sensor_events (session_id, measurement_run_id, encounter_id, device_id, ts, kind, seq, data)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb)
                     ON CONFLICT (device_id, kind, seq) WHERE seq IS NOT NULL DO NOTHING
                     """,
                     (
                         session_id,
                         measurement_run_id,
+                        resolved_encounter_id,
                         device_id,
                         event["ts"],
                         req.kind,
@@ -1577,9 +2330,10 @@ def sensor_event(req: SensorEventReq):
     except psycopg.Error:
         observe_sensor_event(req.kind, "db_error")
         logger.exception(
-            "sensor_event db_error device_external_id=%s session_id=%s measurement_run_id=%s kind=%s seq=%s",
+            "sensor_event db_error device_external_id=%s session_id=%s encounter_id=%s measurement_run_id=%s kind=%s seq=%s",
             req.device_external_id,
             session_id,
+            encounter_id,
             measurement_run_id,
             req.kind,
             req.seq,
@@ -1588,9 +2342,10 @@ def sensor_event(req: SensorEventReq):
     except Exception:
         observe_sensor_event(req.kind, "internal_error")
         logger.exception(
-            "sensor_event unexpected_error device_external_id=%s session_id=%s measurement_run_id=%s kind=%s seq=%s",
+            "sensor_event unexpected_error device_external_id=%s session_id=%s encounter_id=%s measurement_run_id=%s kind=%s seq=%s",
             req.device_external_id,
             session_id,
+            encounter_id,
             measurement_run_id,
             req.kind,
             req.seq,
@@ -1650,6 +2405,39 @@ def last(
         {"ts": r[0].isoformat(), "seq": r[1], "data": r[2], "measurement_run_id": r[3]}
         for r in rows
     ]
+
+@app.get("/api/measurements/history", response_model=MeasurementHistoryResp)
+def measurement_history(
+    user_id: str | None = Query(None),
+    limit: int = Query(50, ge=1, le=200),
+    auth_user_id: str = Depends(require_access_user_id),
+):
+    target_user_id = user_id or auth_user_id
+    try:
+        target_user_id = str(uuid.UUID(target_user_id))
+    except ValueError as exc:
+        raise HTTPException(400, "user_id must be a valid UUID") from exc
+
+    if target_user_id != auth_user_id:
+        raise HTTPException(403, "Cannot access another user's history")
+
+    return build_measurement_history(user_id=target_user_id, limit=limit)
+
+@app.get("/api/measurements/trends", response_model=MeasurementTrendsResp)
+def measurement_trends(
+    user_id: str | None = Query(None),
+    auth_user_id: str = Depends(require_access_user_id),
+):
+    target_user_id = user_id or auth_user_id
+    try:
+        target_user_id = str(uuid.UUID(target_user_id))
+    except ValueError as exc:
+        raise HTTPException(400, "user_id must be a valid UUID") from exc
+
+    if target_user_id != auth_user_id:
+        raise HTTPException(403, "Cannot access another user's trends")
+
+    return build_measurement_trends(user_id=target_user_id)
 
 class ImgRow(BaseModel):
     id: int
@@ -1860,6 +2648,7 @@ async def chat(req: ChatReq, authorization: str | None = Header(None)):
     result_label = "error"
     next_step = None
     recommended_sensor = None
+    encounter_id = _validated_uuid_str(req.encounter_id, "encounter_id")
     try:
         try:
             uuid.UUID(req.user_id)
@@ -1872,6 +2661,19 @@ async def chat(req: ChatReq, authorization: str | None = Header(None)):
             if not cur.fetchone():
                 raise HTTPException(404, "User not found")
 
+            if encounter_id:
+                cur.execute(
+                    """
+                    SELECT 1
+                    FROM user_sessions
+                    WHERE encounter_id = %s AND user_id <> %s
+                    LIMIT 1;
+                    """,
+                    (encounter_id, req.user_id),
+                )
+                if cur.fetchone():
+                    raise HTTPException(400, "encounter_id belongs to another user")
+
             # Validate/create DB-backed session so chat rows always link to a user.
             if session_id:
                 try:
@@ -1881,23 +2683,53 @@ async def chat(req: ChatReq, authorization: str | None = Header(None)):
                     # Treat those as "no session" and create a fresh DB-backed UUID session.
                     session_id = None
 
-                if session_id:
-                    cur.execute(
-                        "SELECT 1 FROM user_sessions WHERE id=%s AND user_id=%s LIMIT 1;",
-                        (session_id, req.user_id),
-                    )
-                    if not cur.fetchone():
-                        raise HTTPException(400, "Invalid session_id for this user")
-            else:
+            if session_id:
                 cur.execute(
                     """
-                    INSERT INTO user_sessions (user_id, started_at, meta)
-                    VALUES (%s, now(), %s::jsonb)
-                    RETURNING id::text;
+                    SELECT COALESCE(encounter_id, id)::text
+                    FROM user_sessions
+                    WHERE id=%s AND user_id=%s
+                    LIMIT 1;
                     """,
-                    (req.user_id, _json.dumps({"source": "api_chat"})),
+                    (session_id, req.user_id),
                 )
-                (session_id,) = cur.fetchone()
+                row = cur.fetchone()
+                if not row:
+                    raise HTTPException(400, "Invalid session_id for this user")
+                session_encounter_id = row[0]
+                if encounter_id and session_encounter_id and encounter_id != session_encounter_id:
+                    raise HTTPException(400, "encounter_id does not match session_id")
+                encounter_id = session_encounter_id or encounter_id
+
+            if not session_id:
+                if encounter_id:
+                    cur.execute(
+                        """
+                        SELECT us.id::text
+                        FROM user_sessions us
+                        WHERE us.user_id = %s
+                          AND us.encounter_id = %s
+                          AND COALESCE(us.meta->>'source', '') = 'api_chat'
+                        ORDER BY COALESCE(us.ended_at, us.started_at) DESC, us.started_at DESC
+                        LIMIT 1;
+                        """,
+                        (req.user_id, encounter_id),
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        session_id = row[0]
+
+                if not session_id:
+                    encounter_id = encounter_id or str(uuid.uuid4())
+                    cur.execute(
+                        """
+                        INSERT INTO user_sessions (user_id, started_at, meta, encounter_id)
+                        VALUES (%s, now(), %s::jsonb, %s)
+                        RETURNING id::text;
+                        """,
+                        (req.user_id, _json.dumps({"source": "api_chat"}), encounter_id),
+                    )
+                    (session_id,) = cur.fetchone()
 
         try:
             rag_invoked = True
@@ -1938,6 +2770,7 @@ async def chat(req: ChatReq, authorization: str | None = Header(None)):
                 if not isinstance(recommended_measurements, list):
                     recommended_measurements = []
                 sensor_confidence = chat_result.get("sensor_confidence")
+                assistant_summary = _coalesce_nonempty(chat_result.get("assistant_summary"), assistant_message)
                 is_actionable_sensor = (
                     recommended_sensor in {
                         "Humidity Sensor",
@@ -1957,6 +2790,7 @@ async def chat(req: ChatReq, authorization: str | None = Header(None)):
                     "last_recommended_measurements": recommended_measurements,
                     "last_sensor_confidence": sensor_confidence,
                     "last_is_actionable_sensor": is_actionable_sensor,
+                    "last_assistant_summary": assistant_summary,
                     "last_assistant_message": assistant_message,
                     "last_chat_at": _utcnow().isoformat(),
                 }
@@ -1987,6 +2821,7 @@ async def chat(req: ChatReq, authorization: str | None = Header(None)):
             raise
 
         chat_result["session_id"] = session_id
+        chat_result["encounter_id"] = encounter_id
         result_label = "ok"
         return chat_result
     finally:
