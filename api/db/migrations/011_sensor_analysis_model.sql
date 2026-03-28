@@ -1,0 +1,2 @@
+ALTER TABLE sensor_analysis
+  ADD COLUMN IF NOT EXISTS model JSONB NOT NULL DEFAULT '{}'::jsonb;

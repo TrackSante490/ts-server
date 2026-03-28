@@ -1,3 +1,5 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+
 fastapi
 uvicorn[standard]
 pydantic
@@ -6,6 +8,9 @@ psycopg[binary]
 pillow
 python-multipart
 prometheus-client
+torch==2.7.0+cpu
+torchvision==0.22.0+cpu
+matplotlib
 
 langchain
 langchain-core

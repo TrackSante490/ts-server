@@ -46,11 +46,13 @@ Below is a practical, human‑readable map of the API routes in `api/app.py` and
 | --- | --- | --- | --- |
 | `GET` | `/auth/register` | Redirects the user to the Authentik enrollment flow. | Requires `AUTH_ENROLLMENT_FLOW_SLUG`. |
 | `GET` | `/auth/login` | Starts OIDC login for web or mobile. | Web flow uses cookies for PKCE; mobile must pass `state` + `code_challenge`. |
-| `POST` | `/auth/mobile/exchange` | Exchanges an auth code + PKCE verifier for TrackSanté access/refresh tokens. | Mobile‑only flow; returns JWTs in JSON. |
-| `GET` | `/auth/oidc/callback` | Completes OIDC login, creates/links user, and sets refresh cookie. | Redirects to the app/site after login. |
+| `POST` | `/auth/mobile/exchange` | Exchanges an auth code + PKCE verifier for TrackSanté access/refresh tokens. | Mobile‑only bootstrap flow; returns app auth state including `role`, `portal`, the default redirect target, and a TrackSanté refresh token for secure device storage. |
+| `GET` | `/auth/oidc/callback` | Completes OIDC login, creates/links user, and sets refresh cookie. | Redirects to the app/site after login, using the doctor portal redirect when the resolved role is `doctor` and no explicit `next` is set. |
 | `POST` | `/auth/logout` | Clears the refresh cookie. | Stateless; returns `{ok: true}`. |
-| `POST` | `/auth/refresh` | Issues a new access token from a refresh cookie. | Returns `{access_token, user_id}`. |
-| `GET` | `/auth/me` | Returns the current user ID from the access token. | Requires `Authorization: Bearer <access_token>`. |
+| `POST` | `/auth/refresh` | Issues a new access token from a TrackSanté refresh token. | Web uses the httpOnly refresh cookie; native mobile can instead send `{refresh_token}` in JSON. Returns `{access_token, user_id, role, portal, is_doctor, default_redirect_url, default_redirect_path}`. |
+| `GET` | `/auth/me` | Returns the current app auth context for the bearer token. | Includes `user_id`, `role`, `portal`, `is_doctor`, `default_redirect_url`, and `default_redirect_path`. |
+
+Doctor-role resolution is driven by Authentik claims returned from OIDC userinfo. The backend looks at `AUTH_ROLE_CLAIM_KEYS` (default: `role,roles,group,groups,ak_groups`) and treats any matching label from `AUTH_DOCTOR_GROUPS` (default: `doctor,doctors`) as a doctor login. The authorize request scopes are configurable via `AUTH_OIDC_SCOPES`, and the web callback uses `AUTH_SUCCESS_REDIRECT_DOCTOR` or `AUTH_SUCCESS_REDIRECT_PATIENT` when no explicit `next` parameter is present.
 
 ### Health and Debug
 
@@ -76,8 +78,9 @@ Below is a practical, human‑readable map of the API routes in `api/app.py` and
 | `POST` | `/api/sessions/end` | Ends a session (idempotent). | Validates `ended_at` vs `started_at`. |
 | `POST` | `/api/sensors/events` | Ingests one sensor event or a batched list of timestamped readings for one sensor kind. | Optional `encounter_id` keeps chat, session, and sensor history joined; `measurement_run_id` groups user-triggered measurement flows; de‑dupes on `(device_id, kind, seq)` when `seq` is present. |
 | `GET` | `/api/sensors/last` | Gets last `n` sensor events by device and kind. | Query params: `device_external_id`, `kind`, `n`, optional `session_id`, optional `measurement_run_id`. |
-| `GET` | `/api/measurements/history` | Returns one joined history item per encounter/session. | Requires access token; supports `user_id` and `limit` query params. |
+| `GET` | `/api/measurements/history` | Returns one explicit history row per measurement capture (`measurement_run_id` + canonical `measurement_id`). | Requires access token; supports `user_id` and `limit` query params. Background telemetry is returned separately with `source=background_telemetry` when present. Rows include latest run-level inference when available (`analysis`, plus compatibility mirrors `analysis_result` and `sensor_analysis`). |
 | `GET` | `/api/measurements/trends` | Returns chart-ready grouped vital series. | Requires access token; supports optional `user_id` query param. |
+| `GET` | `/api/measurements/analysis` | Returns persisted hybrid sensor analysis results for prior measurement runs. | Requires access token; supports optional `measurement_run_id`, optional `user_id`, and `limit`. |
 
 Example batched sensor payload:
 
@@ -104,11 +107,110 @@ Example batched sensor payload:
 
 Send heart rate and SpO2 as separate requests by `kind` such as `hr` and `spo2`. Reuse the same `measurement_run_id` across all user-triggered uploads in one measurement flow, and omit `measurement_run_id` for background ambient uploads.
 
+`POST /api/sensors/events` now also returns a best-effort `analysis` object. The API combines rules with an adaptive baseline model once prior measurement runs exist. When `measurement_run_id` is present, it persists the latest run-level result and exposes it again via `/api/measurements/analysis`.
+
+The sensor ingest path also normalizes mixed hardware payloads into standard analysis fields. A single device packet can include fields like `sht_Tc_x100`, `sht_RH_x100`, `ens_iaq`, `ens_eCO2_ppm`, `mlx_Ta_mC`, `mlx_To_mC`, `hr_bpm`, and `spo2_x10`; the API will derive normalized values such as `ambient_temperature_c`, `humidity_percent`, `air_quality_index`, `co2_ppm`, `skin_temperature_c`, `heart_rate_bpm`, and `spo2_percent` before storage and inference. This lets the current model score `heart_rate` and `spo2` immediately, while keeping `eCO2`, humidity, and ambient temperature as context signals.
+
+The API now auto-loads every `.pt` artifact in `api/models/` by default, so multiple public models can contribute to the same sensor analysis. The current public-model stack is:
+
+- `BIDMC` for `heart_rate`, `spo2`, and optional `respiratory_rate`
+- `PPG-DaLiA` for `heart_rate` and wrist `temperature`
+- `Occupancy Detection` as an environment-context model for ambient `temperature`, `humidity`, and `co2`
+
+To train the BIDMC physiology model on its own, run:
+
+```bash
+python3 scripts/ml/train_bidmc_public_model.py --download-dir /tmp/bidmc
+```
+
+To train the PPG-DaLiA physiology model on its own, run:
+
+```bash
+python3 scripts/ml/train_ppg_dalia_public_model.py --download-dir /tmp/ppg_dalia
+```
+
+To train the ambient environment model on its own, run:
+
+```bash
+python3 scripts/ml/train_occupancy_public_model.py --download-dir /tmp/occupancy
+```
+
+Each trainer writes a `.pt` artifact plus training reports next to it by default, including `training.log`, `training_summary.json`, `subset_metrics.csv`, `loss_history.csv`, `reconstruction_errors.csv`, `loss_curves.png`, and `reconstruction_error_histograms.png`. The API loads all `.pt` artifacts automatically from `SENSOR_PUBLIC_MODEL_DIR` (default: `/app/models`) and adds both a best-match `model.public` result and a `model.public_models` list to sensor analyses when matching metrics are present.
+
+To launch a detached GPU-backed BIDMC-only training job that survives SSH disconnects, run:
+
+```bash
+scripts/ml/launch_bidmc_training.sh --follow
+```
+
+That creates a timestamped run under `ml_runs/`, stores the persistent log at `ml_runs/<run_id>/reports/training.log`, and runs the trainer in a separate Docker container using the `sensor-trainer` service. The current BIDMC trainer covers `heart_rate`, `respiratory_rate`, and `spo2`, and the runtime automatically falls back to the best matching subset model such as `hr_spo2` when your device does not provide respiratory rate. It does not train on temperature, humidity, ambient eCO2, or air-quality context because those channels are not present in BIDMC.
+
+To run the full overnight GPU suite sequentially, use:
+
+```bash
+scripts/ml/launch_public_training_suite.sh -- --quality-profile max --device cuda
+```
+
+That suite trains `BIDMC`, then `PPG-DaLiA`, then the `Occupancy Detection` environment-context model in one GPU container. Each model starts only after the previous one finishes, and the final `.pt` files are copied into `api/models/` so the API can pick them up automatically.
+
+To guarantee one completed run for each dataset first and then do parameter sweeps, use:
+
+```bash
+scripts/ml/launch_public_training_suite.sh -- \
+  --quality-profile balanced \
+  --device cuda \
+  --enable-sweeps \
+  --sweep-profiles balanced,max \
+  --sweep-extra-seeds 1337
+```
+
+That ordering is guaranteed:
+
+- base `BIDMC`
+- base `PPG-DaLiA`
+- base `Occupancy Detection` environment-context model
+- `BIDMC` sweeps
+- `PPG-DaLiA` sweeps
+- `Occupancy Detection` environment-context sweeps
+
+Recommended epoch caps for an overnight run on one GPU:
+
+- base pass: `balanced` profile, which is `160` epochs
+- sweeps: `balanced` and `max`, which are `160` and `320` epochs respectively
+
+Early stopping is enabled, so many sweep runs will finish before those caps, especially for the smaller environment-context model.
+
+During training, you can:
+
+- watch persisted logs with `tail -f ml_runs/<run_id>/reports/training.log`
+- follow container stdout with `docker logs -f capstone-sensor-trainer-<run_id>`
+- inspect graphs and metrics in `ml_runs/<run_id>/reports/`
+
+For the suite runner, use:
+
+- `tail -f ml_runs/<run_id>/suite.log`
+- `docker logs -f capstone-sensor-trainer-suite-<run_id>`
+- inspect per-model reports under `ml_runs/<run_id>/bidmc/reports/`, `ml_runs/<run_id>/ppg_dalia/reports/`, and `ml_runs/<run_id>/occupancy/reports/`
+- inspect per-dataset sweep comparisons in `ml_runs/<run_id>/<dataset>/selection_summary.json`
+
+Each run stores:
+
+- model artifact: `ml_runs/<run_id>/bidmc_public_model.pt`
+- persistent log: `ml_runs/<run_id>/reports/training.log`
+- summary JSON: `ml_runs/<run_id>/reports/training_summary.json`
+- CSV metrics: `subset_metrics.csv`, `loss_history.csv`, `reconstruction_errors.csv`
+- PNG graphs: `loss_curves.png`, `reconstruction_error_histograms.png`
+
+The current public datasets do not cover `air_quality_index` directly, so `AQI` remains a rule-based context feature for now.
+
 ### Files, Images, and Storage
 
 | Method | Path | What it does | Notes |
 | --- | --- | --- | --- |
-| `POST` | `/api/images/upload` | Uploads an image for a device/session, stores in MinIO, and records metadata. | Multipart upload; requires `device_external_id`. |
+| `POST` | `/api/images/upload` | Uploads an image for a device/session, stores in MinIO, and records metadata. | Multipart upload; requires `device_external_id` unless an access token is provided. |
+| `POST` | `/api/images/analyze` | Runs non-diagnostic visual anomaly screening, stores overlay metadata/history, and returns labels + boxes. | Accepts either `image_id` or multipart `file`; `overlay_preview_base64` is transient response-only and object-storage keys are kept internal. |
+| `GET` | `/api/images/history` | Returns persisted visual-screening history for the authenticated user. | Requires access token; supports `limit` and optional `user_id` (must match token subject). |
+| `GET` | `/api/images/analysis` | Returns a persisted visual-screening result for a given `image_id`. | Requires access token; query params: `image_id`, optional `user_id` (must match token subject). |
 | `GET` | `/api/images/list` | Lists images by device or session. | Query params: `device_external_id`, `session_id`, `limit`. |
 | `POST` | `/api/files/upload` | Uploads a PDF medical history file for a user. | Requires access token; PDF only; size limited by `PROFILE_FILE_MAX_MB`. |
 

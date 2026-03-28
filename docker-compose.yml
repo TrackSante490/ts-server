@@ -7,6 +7,7 @@ services:
       bash -lc "pip install --no-cache-dir -r requirements.txt && uvicorn app:app --host 0.0.0.0 --port 8080"
     volumes:
       - ./api:/app
+      - ./scripts:/app/scripts:ro
       - ./cappie_run:/cappie_run
       # persist rag_state sessions outside the container so they don't vanish
       - ./rag_state:/cappie_run/rag_state
@@ -45,6 +46,30 @@ services:
       ollama-init:
         condition: service_completed_successfully
 
+  sensor-trainer:
+    build:
+      context: ./scripts/ml
+      dockerfile: Dockerfile.gpu
+    profiles: ["ml"]
+    working_dir: /workspace
+    entrypoint: ["python", "/workspace/scripts/ml/train_bidmc_public_model.py"]
+    volumes:
+      - .:/workspace
+    environment:
+      PYTHONPATH: "/workspace/api"
+      PYTHONUNBUFFERED: "1"
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    shm_size: "1gb"
+    gpus: all
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
   migrate:
     image: postgres:16
     restart: "no"
@@ -68,9 +93,11 @@ services:
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
       # Keep models resident to avoid repeated cold-load latency.
-      OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:-24h}
-      # Allow both chat + embedding models to remain loaded on the same GPU.
+      OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:--1}
+      # Allow chat and embedding models to remain resident when VRAM allows.
       OLLAMA_MAX_LOADED_MODELS: ${OLLAMA_MAX_LOADED_MODELS:-2}
+      # Avoid extra parallel workers increasing KV-cache pressure on the GPU.
+      OLLAMA_NUM_PARALLEL: ${OLLAMA_NUM_PARALLEL:-1}
     deploy:
       resources:
         reservations:

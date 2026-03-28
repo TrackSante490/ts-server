@@ -123,7 +123,21 @@ WEB_ORIGIN=https://app.tracksante.com
 AUTH_PUBLIC_BASE=https://auth.tracksante.com
 AUTH_REDIRECT_URI_WEB=https://api.tracksante.com/auth/oidc/callback
 AUTH_SUCCESS_REDIRECT=https://app.tracksante.com/
+AUTH_SUCCESS_REDIRECT_PATIENT=https://app.tracksante.com/
+AUTH_SUCCESS_REDIRECT_DOCTOR=https://app.tracksante.com/doctor
+AUTH_OIDC_SCOPES="openid email profile groups"
+AUTH_DOCTOR_GROUPS=doctor,doctors
 ```
+
+`AUTH_SUCCESS_REDIRECT_DOCTOR` is used automatically by the API callback when Authentik resolves the user as a doctor and the frontend did not pass an explicit `next` query parameter to `/auth/login`.
+
+For the frontend boot flow, call `/auth/refresh` or `/auth/me` and read:
+
+- `portal`: `doctor` or `patient`
+- `is_doctor`: boolean convenience flag
+- `default_redirect_path`: route-safe path such as `/doctor`
+
+For native mobile, use `/auth/mobile/exchange` once after the PKCE callback/deep link to receive the TrackSanté refresh token, then store that refresh token securely in the app and use `/auth/refresh` with `{ "refresh_token": "..." }` for subsequent app boots.
 
 Restart API:
 
