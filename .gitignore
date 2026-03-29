@@ -23,6 +23,7 @@ cappie_run/
 logs/
 rag_state/
 vectordb/
+ml_runs/
 *.sqlite3
 *.bin
 *.deployed_sha

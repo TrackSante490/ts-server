@@ -160,6 +160,11 @@ SENSOR_ANALYZER_VERSION = os.getenv("SENSOR_ANALYZER_VERSION", "hybrid-v2")
 SENSOR_MODEL_VERSION = os.getenv("SENSOR_MODEL_VERSION", "adaptive-baseline-v1")
 SENSOR_MODEL_HISTORY_LIMIT = int(os.getenv("SENSOR_MODEL_HISTORY_LIMIT", "50"))
 SENSOR_MODEL_MIN_SAMPLES = int(os.getenv("SENSOR_MODEL_MIN_SAMPLES", "5"))
+SENSOR_PERSONALIZATION_ENABLED = os.getenv("SENSOR_PERSONALIZATION_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
+SENSOR_PERSONALIZATION_MIN_SAMPLES = max(1, int(os.getenv("SENSOR_PERSONALIZATION_MIN_SAMPLES", str(SENSOR_MODEL_MIN_SAMPLES))))
+SENSOR_PERSONALIZATION_ALERT_Z = float(os.getenv("SENSOR_PERSONALIZATION_ALERT_Z", "3.2"))
+SENSOR_PERSONALIZATION_MAX_SCORE_REDUCTION = max(0.0, min(0.4, float(os.getenv("SENSOR_PERSONALIZATION_MAX_SCORE_REDUCTION", "0.18"))))
+SENSOR_PERSONALIZATION_MAX_CONFIDENCE_BOOST = max(0.0, min(0.25, float(os.getenv("SENSOR_PERSONALIZATION_MAX_CONFIDENCE_BOOST", "0.12"))))
 IMAGE_ANALYSIS_LINK_WINDOW_MINUTES = int(os.getenv("IMAGE_ANALYSIS_LINK_WINDOW_MINUTES", "15"))
 IMAGE_ANALYSIS_RETENTION_DAYS = max(0, int(os.getenv("IMAGE_ANALYSIS_RETENTION_DAYS", "365")))
 IMAGE_ANALYSIS_RETENTION_POLICY = os.getenv("IMAGE_ANALYSIS_RETENTION_POLICY", "standard").strip() or "standard"
@@ -173,9 +178,53 @@ OPTICAL_WAVEFORM_MAX_POINTS = max(OPTICAL_WAVEFORM_DEFAULT_MAX_POINTS, int(os.ge
 OPTICAL_MEASUREMENT_MODE = "advanced_optical"
 OPTICAL_MEASUREMENT_ID = "advanced_optical"
 OPTICAL_MEASUREMENT_LABEL = "Optical waveform capture"
+STANDARD_OPTICAL_MEASUREMENT_MODE = "standard_optical"
 OPTICAL_RUN_STATUS_ACTIVE = "active"
 OPTICAL_RUN_STATUS_STOPPED = "stopped"
 OPTICAL_RUN_STATUS_FAILED = "failed"
+OPTICAL_ANALYSIS_STATUS_PROCESSING = "processing"
+OPTICAL_ANALYSIS_STATUS_COMPLETED = "completed"
+OPTICAL_ANALYSIS_STATUS_FAILED = "failed"
+OPTICAL_FINAL_OPTICAL_QUALITY_GOOD = "good"
+OPTICAL_FINAL_OPTICAL_QUALITY_FAIR = "fair"
+OPTICAL_FINAL_OPTICAL_QUALITY_POOR = "poor"
+OPTICAL_FINAL_OPTICAL_QUALITY_INSUFFICIENT = "insufficient_signal"
+OPTICAL_FINAL_OPTICAL_ALGORITHM_VERSION = os.getenv("OPTICAL_FINAL_OPTICAL_ALGORITHM_VERSION", "raw-ppg-final-v1").strip() or "raw-ppg-final-v1"
+OPTICAL_PPG_SERIES_KEYS = ("ppg_ir", "ppg_red")
+OPTICAL_PPG_SERIES_ALIASES: dict[str, tuple[str, ...]] = {
+    "ppg_ir": ("ppg_ir", "ir", "infrared", "ir_value", "ir_sample", "infrared_value"),
+    "ppg_red": ("ppg_red", "red", "red_value", "red_sample"),
+}
+OPTICAL_TS1_NORMALIZED_FIELDS: tuple[str, ...] = (
+    "timestamp_ms",
+    "sht_temp_c",
+    "sht_rh_percent",
+    "ens_iaq",
+    "ens_eco2_ppm",
+    "ens_temp_c",
+    "mlx_ambient_c",
+    "mlx_object_c",
+    "heart_rate_bpm",
+    "spo2_percent",
+    "red_dc",
+    "quality",
+)
+OPTICAL_TS1_SERIES_FIELDS: tuple[str, ...] = tuple(
+    field for field in OPTICAL_TS1_NORMALIZED_FIELDS if field != "timestamp_ms"
+)
+OPTICAL_TS1_SERIES_LABELS: dict[str, str] = {
+    "ts1_sht_temp_c": "TS1 SHT Temperature",
+    "ts1_sht_rh_percent": "TS1 SHT Humidity",
+    "ts1_ens_iaq": "TS1 IAQ",
+    "ts1_ens_eco2_ppm": "TS1 eCO2",
+    "ts1_ens_temp_c": "TS1 ENS Temperature",
+    "ts1_mlx_ambient_c": "TS1 MLX Ambient Temperature",
+    "ts1_mlx_object_c": "TS1 MLX Object Temperature",
+    "ts1_heart_rate_bpm": "TS1 Heart Rate",
+    "ts1_spo2_percent": "TS1 SpO2",
+    "ts1_red_dc": "TS1 Red DC",
+    "ts1_quality": "TS1 Quality",
+}
 SENSOR_MODEL_ANOMALY_Z = float(os.getenv("SENSOR_MODEL_ANOMALY_Z", "3.0"))
 SENSOR_PUBLIC_MODEL_PATH = os.getenv("SENSOR_PUBLIC_MODEL_PATH", "/app/models/bidmc_public_model.pt")
 SENSOR_PUBLIC_MODEL_DIR = os.getenv("SENSOR_PUBLIC_MODEL_DIR", "/app/models")
@@ -2085,6 +2134,149 @@ def _apply_public_dataset_model(analysis: dict[str, Any]) -> dict[str, Any]:
 
     return analysis
 
+
+def _apply_personalization_model(
+    cur,
+    *,
+    analysis: dict[str, Any],
+    device_id: str,
+    session_id: str | None,
+    encounter_id: str | None,
+    measurement_run_id: str | None,
+) -> dict[str, Any]:
+    model_bucket = analysis.get("model")
+    if not isinstance(model_bucket, dict):
+        model_bucket = {}
+
+    personalization_model: dict[str, Any] = {
+        "name": "personalization-calibration-v1",
+        "type": "calibration",
+        "enabled": SENSOR_PERSONALIZATION_ENABLED,
+        "ready": False,
+        "status": "disabled" if not SENSOR_PERSONALIZATION_ENABLED else "warming_up",
+        "history_runs": 0,
+        "sample_count": 0,
+        "max_z_score": None,
+        "score_reduction": 0.0,
+        "confidence_boost": 0.0,
+        "contributors": [],
+    }
+    model_bucket["personalization"] = personalization_model
+    analysis["model"] = model_bucket
+
+    if not SENSOR_PERSONALIZATION_ENABLED:
+        return analysis
+
+    latest_values = {
+        metric: float(value)
+        for metric, value in (analysis.get("latest_values") or {}).items()
+        if isinstance(value, (int, float))
+    }
+    if not latest_values:
+        return analysis
+
+    subject_user_id, _subject_type = _resolve_analysis_subject(
+        cur,
+        session_id=session_id,
+        encounter_id=encounter_id,
+        device_id=device_id,
+    )
+    history, history_rows = _historical_metric_values(
+        cur,
+        user_id=subject_user_id,
+        device_id=device_id,
+        measurement_run_id=measurement_run_id,
+    )
+    personalization_model["history_runs"] = int(history_rows)
+
+    contributors: list[dict[str, Any]] = []
+    sample_counts: list[int] = []
+    for metric, current_value in latest_values.items():
+        series = history.get(metric, [])
+        if len(series) < SENSOR_PERSONALIZATION_MIN_SAMPLES:
+            continue
+
+        baseline = _robust_baseline_stats(series)
+        if baseline is None:
+            continue
+
+        mad = float(baseline.get("mad") or 0.0)
+        stddev = float(baseline.get("stddev") or 0.0)
+        median = float(baseline.get("median") or 0.0)
+        mean = float(baseline.get("mean") or 0.0)
+        if mad > 0:
+            z_score = 0.6745 * abs(current_value - median) / mad
+        elif stddev > 0:
+            z_score = abs(current_value - mean) / stddev
+        else:
+            z_score = 0.0
+
+        samples = int(baseline.get("samples") or 0)
+        contributors.append(
+            {
+                "metric": metric,
+                "label": _metric_label(metric),
+                "value": _round_number(current_value),
+                "baseline_median": _round_number(median),
+                "samples": samples,
+                "z_score": _round_number(z_score),
+            }
+        )
+        sample_counts.append(samples)
+
+    if not contributors:
+        return analysis
+
+    contributors.sort(key=lambda item: item.get("z_score") or 0.0, reverse=True)
+    max_z = float(contributors[0].get("z_score") or 0.0)
+    sample_floor = min(sample_counts)
+    history_factor = min(1.0, sample_floor / 30.0)
+    stability = max(0.0, min(1.0, 1.0 - (max_z / max(1.0, SENSOR_PERSONALIZATION_ALERT_Z))))
+
+    score_reduction = SENSOR_PERSONALIZATION_MAX_SCORE_REDUCTION * history_factor * stability
+    boosted_confidence = SENSOR_PERSONALIZATION_MAX_CONFIDENCE_BOOST * history_factor
+
+    personalization_model.update(
+        {
+            "ready": True,
+            "status": "ready",
+            "sample_count": sample_floor,
+            "max_z_score": _round_number(max_z),
+            "score_reduction": _round_number(score_reduction, 4),
+            "confidence_boost": _round_number(boosted_confidence, 4),
+            "contributors": contributors[:3],
+        }
+    )
+
+    current_score = float(analysis.get("score") or 0.0)
+    if score_reduction > 0:
+        analysis["score"] = _round_number(max(0.0, current_score - score_reduction))
+
+    current_confidence = float(analysis.get("confidence") or 0.0)
+    if boosted_confidence > 0:
+        analysis["confidence"] = _round_number(min(0.98, current_confidence + boosted_confidence))
+
+    if analysis.get("status") == "normal" and max_z >= SENSOR_PERSONALIZATION_ALERT_Z:
+        lead = contributors[0]
+        findings = analysis.get("findings") or []
+        findings.append(
+            _make_analysis_finding(
+                "personalized_shift",
+                "high" if max_z >= (SENSOR_PERSONALIZATION_ALERT_Z + 1.0) else "medium",
+                "model",
+                f"{lead['label']} is outside this subject's usual pattern.",
+                str(lead.get("metric") or "") or None,
+            )
+        )
+        analysis["findings"] = findings
+        analysis["status"] = "unusual"
+        analysis["summary"] = (
+            f"{lead['label']} is outside this subject's usual pattern. "
+            f"{analysis.get('summary') or ''}"
+        ).strip()
+
+    return analysis
+
 def build_report_payload(user_id: str, limit_sessions: int, limit_events: int) -> dict[str, Any]:
     # Build a compact payload for report generation.
     with db() as conn, conn.cursor() as cur:
@@ -3040,15 +3232,122 @@ class OpticalCaptureChunkReq(BaseModel):
     chunk_index: int = Field(ge=0)
     chunk_started_at: datetime | None = None
     chunk_ended_at: datetime | None = None
-    packet_loss_count_delta: int = Field(default=0, ge=0)
-    checksum_failure_count_delta: int = Field(default=0, ge=0)
-    malformed_packet_count_delta: int = Field(default=0, ge=0)
+    packet_loss_count_delta: int = Field(
+        default=0,
+        ge=0,
+        description="Packet-loss count observed within this chunk. Omitting the field and sending 0 are treated the same.",
+    )
+    checksum_failure_count_delta: int = Field(
+        default=0,
+        ge=0,
+        description="Checksum-failure count observed within this chunk. Omitting the field and sending 0 are treated the same.",
+    )
+    malformed_packet_count_delta: int = Field(
+        default=0,
+        ge=0,
+        description="Malformed-packet count observed within this chunk. Omitting the field and sending 0 are treated the same.",
+    )
     ppg_packets: list[dict[str, Any]] = Field(default_factory=list)
     ts1_frames: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class OpticalCaptureStopReq(BaseModel):
     stopped_at: datetime | None = None
+
+
+class OpticalFinalOpticalResult(BaseModel):
+    heart_rate_bpm: float | None = None
+    spo2_percent: float | None = None
+    confidence: float = 0.0
+    quality: str = OPTICAL_FINAL_OPTICAL_QUALITY_INSUFFICIENT
+    sample_count_used: int = 0
+    algorithm_version: str = OPTICAL_FINAL_OPTICAL_ALGORITHM_VERSION
+    window_seconds: float = 0.0
+    derived_from: str = "raw_ppg"
+    rejection_reason: str | None = None
+
+
+class MeasurementRunAnalysisResp(BaseModel):
+    measurement_run_id: str
+    status: str = OPTICAL_ANALYSIS_STATUS_PROCESSING
+    final_optical: OpticalFinalOpticalResult | None = None
+    analyzed_at: datetime | None = None
+
+
+class OpticalCaptureRunItem(BaseModel):
+    measurement_run_id: str
+    patient_user_id: str
+    encounter_id: str | None = None
+    session_id: str | None = None
+    device_external_id: str
+    mode: str = OPTICAL_MEASUREMENT_MODE
+    status: str = OPTICAL_RUN_STATUS_ACTIVE
+    started_at: datetime
+    stopped_at: datetime | None = None
+    sample_rate_hz: float | None = None
+    requested_measurements: list[str] = Field(default_factory=list)
+    raw_waveform_available: bool = False
+    total_chunks: int = 0
+    total_packets: int = 0
+    total_samples: int = 0
+    ts1_frame_count: int = 0
+    packet_loss_count: int = 0
+    checksum_failure_count: int = 0
+    malformed_packet_count: int = 0
+    latest_chunk_at: datetime | None = None
+    waveform_api_path: str | None = None
+    waveform_stream_path: str | None = None
+
+
+class OpticalCaptureRunResp(BaseModel):
+    run: OpticalCaptureRunItem
+    analysis: MeasurementRunAnalysisResp | None = None
+    created: bool = False
+    already_exists: bool = False
+    already_stopped: bool = False
+
+
+class OpticalCaptureChunkResp(BaseModel):
+    measurement_run_id: str
+    chunk_index: int
+    stored: bool = True
+    duplicate: bool = False
+    run: OpticalCaptureRunItem
+
+
+class OpticalWaveformGap(BaseModel):
+    kind: str = Field(default="gap", description="Stable marker type for viewer gap metadata.")
+    reason: str = Field(description="Why the gap marker was emitted, such as 'time_gap' or 'packet_loss'.")
+    start_ts: str | None = Field(default=None, description="ISO 8601 timestamp at the start edge of the gap.")
+    end_ts: str | None = Field(default=None, description="ISO 8601 timestamp at the end edge of the gap.")
+    gap_ms: float | None = Field(default=None, description="Observed elapsed milliseconds across the gap when known.")
+    expected_interval_ms: float | None = Field(
+        default=None,
+        description="Expected sample/frame interval in milliseconds when the gap was detected from time spacing.",
+    )
+    chunk_index: int | None = Field(default=None, description="Chunk index that produced the gap marker when applicable.")
+    packet_loss_count_delta: int | None = Field(
+        default=None,
+        description="Packet-loss count attached to this gap marker when the gap was sourced from chunk loss metadata.",
+    )
+
+
+class OpticalWaveformSeries(BaseModel):
+    series: str
+    kind: str
+    label: str | None = None
+    unit: str | None = None
+    points: list[dict[str, Any]] = Field(default_factory=list)
+    gaps: list[OpticalWaveformGap] = Field(default_factory=list)
+    meta: dict[str, Any] = Field(default_factory=dict)
+
+
+class OpticalWaveformResp(BaseModel):
+    measurement_run_id: str
+    run: OpticalCaptureRunItem
+    filters: dict[str, Any] = Field(default_factory=dict)
+    available_series: list[str] = Field(default_factory=list)
+    series: list[OpticalWaveformSeries] = Field(default_factory=list)
 
 class ChatReq(BaseModel):
     user_id: str
@@ -4821,6 +5120,92 @@ def _ensure_consult_case(
     if case is None:
         raise HTTPException(500, "Unable to resolve consult case")
     return case
+
+
+def _close_consult_case_for_doctor_removal(
+    cur,
+    *,
+    doctor_user_id: str,
+    patient_user_id: str,
+) -> dict[str, Any] | None:
+    closed_reason = "Doctor removed patient assignment."
+    cur.execute(
+        """
+        UPDATE consult_cases
+        SET consult_status = %s,
+            consult_status_reason = %s,
+            closed_reason = %s,
+            closed_at = COALESCE(closed_at, now()),
+            next_action_due_at = NULL,
+            next_follow_up_due_at = NULL,
+            handoff_requested = FALSE,
+            handoff_target_clinician_id = NULL,
+            last_action_summary = %s,
+            last_clinician_action_at = now(),
+            last_clinician_action_type = 'consult_closed',
+            updated_at = now(),
+            revision = revision + 1
+        WHERE doctor_user_id = %s
+          AND patient_user_id = %s
+          AND closed_at IS NULL
+        RETURNING id::text,
+                  doctor_user_id::text,
+                  patient_user_id::text,
+                  consult_status,
+                  priority,
+                  escalation_status,
+                  opened_at,
+                  closed_at,
+                  consult_status_reason,
+                  next_action_due_at,
+                  next_follow_up_due_at,
+                  last_action_summary,
+                  attention_score,
+                  attention_reasons,
+                  last_patient_activity_at,
+                  last_clinician_activity_at,
+                  last_critical_event_at,
+                  updated_at,
+                  revision,
+                  closed_reason,
+                  handoff_requested,
+                  handoff_target_clinician_id::text,
+                  reopened_at,
+                  last_clinician_action_at,
+                  last_clinician_action_type,
+                  (SELECT name FROM users WHERE id = consult_cases.doctor_user_id),
+                  (SELECT email FROM users WHERE id = consult_cases.doctor_user_id),
+                  (SELECT name FROM users WHERE id = consult_cases.handoff_target_clinician_id),
+                  (SELECT profile FROM user_profile WHERE user_id = consult_cases.doctor_user_id)
+        """,
+        (
+            CONSULT_STATUS_CLOSED,
+            closed_reason,
+            closed_reason,
+            closed_reason,
+            doctor_user_id,
+            patient_user_id,
+        ),
+    )
+    row = cur.fetchone()
+    if not row:
+        return None
+
+    consult_case = _consult_case_from_row(row)
+    _insert_consult_case_event(
+        cur,
+        consult_case_id=consult_case["consult_case_id"],
+        doctor_user_id=doctor_user_id,
+        patient_user_id=patient_user_id,
+        event_type="case_closed",
+        summary="Case closed after doctor removed patient assignment.",
+        metadata={
+            "current_status": CONSULT_STATUS_CLOSED,
+            "closed_reason": closed_reason,
+            "close_source": "doctor_patient_removal",
+        },
+    )
+    return consult_case
 
 
 def _resolve_patient_consult_case(
@@ -6878,6 +7263,1395 @@ def _parse_iso_datetime(value: Any) -> datetime | None:
     return parsed
 
 
+def _parse_epoch_datetime(value: Any) -> datetime | None:
+    numeric = _as_number(value)
+    if numeric is None or not math.isfinite(numeric):
+        return None
+
+    seconds: float | None = None
+    magnitude = abs(numeric)
+    if magnitude >= 1_000_000_000_00:
+        seconds = float(numeric) / 1000.0
+    elif magnitude >= 1_000_000_000:
+        seconds = float(numeric)
+
+    if seconds is None:
+        return None
+
+    try:
+        return datetime.fromtimestamp(seconds, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _parse_datetime_like(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+    if isinstance(value, str):
+        parsed = _parse_iso_datetime(value)
+        if parsed is not None:
+            return parsed
+    return _parse_epoch_datetime(value)
+
+
+def _normalize_requested_measurements(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, str):
+            continue
+        token = item.strip().lower().replace(" ", "_")
+        if not token or token in seen:
+            continue
+        seen.add(token)
+        result.append(token)
+    return result
+
+
+def _optical_waveform_api_path(measurement_run_id: str) -> str:
+    return f"/api/measurements/optical/runs/{measurement_run_id}/waveform"
+
+
+def _optical_waveform_stream_path(measurement_run_id: str) -> str:
+    return f"/api/measurements/optical/runs/{measurement_run_id}/stream"
+
+
+def _serialize_optical_capture_run_row(row: Any) -> dict[str, Any]:
+    return {
+        "measurement_run_id": row[0],
+        "patient_user_id": row[1],
+        "encounter_id": row[2],
+        "session_id": row[3],
+        "device_external_id": row[4],
+        "mode": row[5] or OPTICAL_MEASUREMENT_MODE,
+        "status": row[6] or OPTICAL_RUN_STATUS_ACTIVE,
+        "started_at": row[7],
+        "stopped_at": row[8],
+        "sample_rate_hz": _as_number(row[9]),
+        "requested_measurements": _normalize_requested_measurements(row[10]),
+        "raw_waveform_available": bool(row[11]),
+        "total_chunks": int(row[12] or 0),
+        "total_packets": int(row[13] or 0),
+        "total_samples": int(row[14] or 0),
+        "ts1_frame_count": int(row[15] or 0),
+        "packet_loss_count": int(row[16] or 0),
+        "checksum_failure_count": int(row[17] or 0),
+        "malformed_packet_count": int(row[18] or 0),
+        "latest_chunk_at": row[19],
+        "waveform_api_path": _optical_waveform_api_path(row[0]),
+        "waveform_stream_path": _optical_waveform_stream_path(row[0]),
+    }
+
+
+def _fetch_optical_capture_run_row(cur, measurement_run_id: str) -> Any:
+    cur.execute(
+        """
+        SELECT o.measurement_run_id::text,
+               o.patient_user_id::text,
+               COALESCE(o.encounter_id::text, us.encounter_id::text, us.id::text),
+               o.session_id::text,
+               o.device_external_id,
+               o.mode,
+               o.status,
+               o.started_at,
+               o.stopped_at,
+               o.sample_rate_hz,
+               o.requested_measurements,
+               o.raw_waveform_available,
+               o.total_chunks,
+               o.total_packets,
+               o.total_samples,
+               o.ts1_frame_count,
+               o.packet_loss_count,
+               o.checksum_failure_count,
+               o.malformed_packet_count,
+               o.latest_chunk_at
+        FROM optical_capture_runs o
+        LEFT JOIN user_sessions us ON us.id = o.session_id
+        WHERE o.measurement_run_id = %s
+        LIMIT 1
+        """,
+        (measurement_run_id,),
+    )
+    return cur.fetchone()
+
+
+def _list_optical_capture_chunk_rows(cur, measurement_run_id: str) -> list[Any]:
+    cur.execute(
+        """
+        SELECT chunk_index,
+               chunk_started_at,
+               chunk_ended_at,
+               packet_count,
+               sample_count,
+               first_packet_id,
+               last_packet_id,
+               packet_loss_count_delta,
+               payload_json
+        FROM optical_capture_chunks
+        WHERE measurement_run_id = %s
+        ORDER BY chunk_started_at ASC NULLS FIRST, chunk_index ASC
+        """,
+        (measurement_run_id,),
+    )
+    return cur.fetchall()
+
+
+def _fetch_optical_capture_run_analysis(cur, measurement_run_id: str) -> dict[str, Any] | None:
+    cur.execute(
+        """
+        SELECT status,
+               analysis_payload,
+               analyzed_at
+        FROM optical_capture_run_analysis
+        WHERE measurement_run_id = %s
+        LIMIT 1
+        """,
+        (measurement_run_id,),
+    )
+    row = cur.fetchone()
+    if not row:
+        return None
+    payload = row[1] if isinstance(row[1], dict) else {}
+    return {
+        "measurement_run_id": measurement_run_id,
+        "status": str(row[0] or OPTICAL_ANALYSIS_STATUS_PROCESSING),
+        "final_optical": payload.get("final_optical") if isinstance(payload.get("final_optical"), dict) else None,
+        "analyzed_at": row[2],
+    }
+
+
+def _persist_optical_capture_run_analysis(cur, *, measurement_run_id: str, analysis: dict[str, Any]) -> dict[str, Any]:
+    analyzed_at = analysis.get("analyzed_at") if isinstance(analysis.get("analyzed_at"), datetime) else _utcnow()
+    payload = {
+        "final_optical": analysis.get("final_optical") if isinstance(analysis.get("final_optical"), dict) else None,
+    }
+    cur.execute(
+        """
+        INSERT INTO optical_capture_run_analysis (
+            measurement_run_id,
+            status,
+            analysis_payload,
+            analyzed_at
+        )
+        VALUES (%s, %s, %s::jsonb, %s)
+        ON CONFLICT (measurement_run_id) DO UPDATE
+        SET status = EXCLUDED.status,
+            analysis_payload = EXCLUDED.analysis_payload,
+            analyzed_at = EXCLUDED.analyzed_at
+        RETURNING status,
+                  analysis_payload,
+                  analyzed_at
+        """,
+        (
+            measurement_run_id,
+            str(analysis.get("status") or OPTICAL_ANALYSIS_STATUS_PROCESSING),
+            _json.dumps(jsonable_encoder(payload, exclude_none=True)),
+            analyzed_at,
+        ),
+    )
+    row = cur.fetchone()
+    stored_payload = row[1] if row and isinstance(row[1], dict) else payload
+    return {
+        "measurement_run_id": measurement_run_id,
+        "status": row[0] if row else str(analysis.get("status") or OPTICAL_ANALYSIS_STATUS_PROCESSING),
+        "final_optical": stored_payload.get("final_optical") if isinstance(stored_payload.get("final_optical"), dict) else None,
+        "analyzed_at": row[2] if row else analyzed_at,
+    }
+
+
+def _clamp_number(value: float, lower: float, upper: float) -> float:
+    return max(lower, min(upper, value))
+
+
+def _moving_average(values: list[float], window_size: int) -> list[float]:
+    if not values:
+        return []
+    if window_size <= 1:
+        return [float(value) for value in values]
+
+    prefix: list[float] = [0.0]
+    for value in values:
+        prefix.append(prefix[-1] + float(value))
+
+    half_window = window_size // 2
+    averaged: list[float] = []
+    for index in range(len(values)):
+        start = max(0, index - half_window)
+        end = min(len(values), index + half_window + 1)
+        averaged.append((prefix[end] - prefix[start]) / float(end - start))
+    return averaged
+
+
+def _estimate_effective_sample_rate_hz(points: list[dict[str, Any]], fallback_hz: float | None) -> float | None:
+    if fallback_hz and fallback_hz > 0:
+        return float(fallback_hz)
+    if len(points) < 2:
+        return None
+    start_dt = points[0].get("_dt")
+    end_dt = points[-1].get("_dt")
+    if not isinstance(start_dt, datetime) or not isinstance(end_dt, datetime) or end_dt <= start_dt:
+        return None
+    duration_seconds = (end_dt - start_dt).total_seconds()
+    if duration_seconds <= 0:
+        return None
+    return float((len(points) - 1) / duration_seconds)
+
+
+def _detect_optical_ppg_peaks(points: list[dict[str, Any]], sample_rate_hz: float | None) -> tuple[list[int], list[float], float | None, float | None]:
+    values = [float(point.get("value") or 0.0) for point in points]
+    if len(values) < 3:
+        return [], [], sample_rate_hz, None
+
+    effective_sample_rate_hz = _estimate_effective_sample_rate_hz(points, sample_rate_hz)
+    if effective_sample_rate_hz is None or effective_sample_rate_hz <= 0:
+        return [], [], None, None
+
+    short_window = max(3, int(effective_sample_rate_hz * 0.15))
+    if short_window % 2 == 0:
+        short_window += 1
+    long_window = max(short_window + 2, int(effective_sample_rate_hz * 0.8))
+    if long_window % 2 == 0:
+        long_window += 1
+
+    smoothed = _moving_average(values, short_window)
+    baseline = _moving_average(smoothed, long_window)
+    detrended = [smoothed[index] - baseline[index] for index in range(len(smoothed))]
+    if len(detrended) < 3:
+        return [], [], effective_sample_rate_hz, None
+
+    amplitude_std = statistics.pstdev(detrended)
+    if not math.isfinite(amplitude_std) or amplitude_std <= 1e-9:
+        return [], detrended, effective_sample_rate_hz, None
+
+    threshold = amplitude_std * 0.35
+    min_peak_distance = max(1, int(effective_sample_rate_hz * 0.33))
+    peaks: list[int] = []
+    for index in range(1, len(detrended) - 1):
+        candidate = detrended[index]
+        if candidate < threshold:
+            continue
+        if candidate <= detrended[index - 1] or candidate < detrended[index + 1]:
+            continue
+        if peaks and index - peaks[-1] < min_peak_distance:
+            if candidate > detrended[peaks[-1]]:
+                peaks[-1] = index
+            continue
+        peaks.append(index)
+
+    return peaks, detrended, effective_sample_rate_hz, amplitude_std
+
+
+def _optical_peak_intervals_seconds(points: list[dict[str, Any]], peak_indices: list[int], sample_rate_hz: float | None) -> list[float]:
+    intervals: list[float] = []
+    for previous_index, current_index in zip(peak_indices, peak_indices[1:]):
+        if current_index <= previous_index:
+            continue
+        previous_dt = points[previous_index].get("_dt")
+        current_dt = points[current_index].get("_dt")
+        if isinstance(previous_dt, datetime) and isinstance(current_dt, datetime) and current_dt > previous_dt:
+            interval_seconds = (current_dt - previous_dt).total_seconds()
+        elif sample_rate_hz and sample_rate_hz > 0:
+            interval_seconds = float(current_index - previous_index) / float(sample_rate_hz)
+        else:
+            continue
+        if interval_seconds > 0:
+            intervals.append(interval_seconds)
+    return intervals
+
+
+def _derive_optical_final_result(run_payload: dict[str, Any], chunk_rows: list[Any]) -> dict[str, Any]:
+    points_by_series, _extra_gaps = _extract_optical_ppg_points(
+        chunk_rows,
+        sample_rate_hz=run_payload.get("sample_rate_hz"),
+        from_dt=None,
+        to_dt=None,
+    )
+    ir_points = points_by_series.get("ppg_ir") or []
+    red_points = points_by_series.get("ppg_red") or []
+
+    sample_count_used = min(len(ir_points), len(red_points)) if red_points else len(ir_points)
+    start_candidates = [point.get("_dt") for point in (ir_points[:1] + red_points[:1]) if isinstance(point.get("_dt"), datetime)]
+    end_candidates = [point.get("_dt") for point in ((ir_points[-1:] if ir_points else []) + (red_points[-1:] if red_points else [])) if isinstance(point.get("_dt"), datetime)]
+    start_dt = min(start_candidates) if start_candidates else None
+    end_dt = max(end_candidates) if end_candidates else None
+    window_seconds = (end_dt - start_dt).total_seconds() if isinstance(start_dt, datetime) and isinstance(end_dt, datetime) and end_dt > start_dt else 0.0
+    packet_loss_ratio = float(run_payload.get("packet_loss_count") or 0) / float(max(1, int(run_payload.get("total_samples") or sample_count_used or 1)))
+
+    final_optical: dict[str, Any] = {
+        "heart_rate_bpm": None,
+        "spo2_percent": None,
+        "confidence": 0.0,
+        "quality": OPTICAL_FINAL_OPTICAL_QUALITY_INSUFFICIENT,
+        "sample_count_used": int(sample_count_used),
+        "algorithm_version": OPTICAL_FINAL_OPTICAL_ALGORITHM_VERSION,
+        "window_seconds": _round_number(window_seconds, 2) or 0.0,
+        "derived_from": "raw_ppg",
+        "rejection_reason": None,
+    }
+
+    if not ir_points:
+        final_optical["rejection_reason"] = "No infrared PPG samples were uploaded for this run."
+        return final_optical
+    if sample_count_used < 120 or window_seconds < 4.0:
+        final_optical["rejection_reason"] = "Not enough raw PPG data was uploaded to compute a final result."
+        return final_optical
+
+    peak_indices, _detrended_ir, effective_sample_rate_hz, amplitude_std = _detect_optical_ppg_peaks(ir_points, run_payload.get("sample_rate_hz"))
+    if not peak_indices or len(peak_indices) < 3 or effective_sample_rate_hz is None:
+        final_optical["rejection_reason"] = "Pulse peaks could not be resolved from the uploaded raw PPG signal."
+        return final_optical
+
+    intervals_seconds = _optical_peak_intervals_seconds(ir_points, peak_indices, effective_sample_rate_hz)
+    if len(intervals_seconds) < 2:
+        final_optical["rejection_reason"] = "Not enough stable pulse intervals were detected in the raw PPG signal."
+        return final_optical
+
+    median_interval_seconds = statistics.median(intervals_seconds)
+    if not math.isfinite(median_interval_seconds) or median_interval_seconds <= 0:
+        final_optical["rejection_reason"] = "Pulse intervals from the uploaded raw PPG were invalid."
+        return final_optical
+
+    heart_rate_bpm = 60.0 / median_interval_seconds
+    if not math.isfinite(heart_rate_bpm) or heart_rate_bpm < 35.0 or heart_rate_bpm > 220.0:
+        final_optical["rejection_reason"] = "The derived heart-rate value was outside the valid range."
+        return final_optical
+
+    interval_mean_seconds = statistics.fmean(intervals_seconds)
+    interval_cv = statistics.pstdev(intervals_seconds) / interval_mean_seconds if len(intervals_seconds) > 1 and interval_mean_seconds > 0 else 1.0
+    ir_values = [float(point.get("value") or 0.0) for point in ir_points]
+    mean_ir_value = statistics.fmean(ir_values) if ir_values else 0.0
+    signal_relative_amplitude = abs(amplitude_std) / max(abs(mean_ir_value), 1e-9) if amplitude_std is not None else 0.0
+    signal_confidence = _clamp_number(signal_relative_amplitude * 12.0, 0.0, 1.0)
+    rhythm_confidence = _clamp_number(1.0 - (interval_cv / 0.35), 0.0, 1.0)
+    duration_confidence = _clamp_number(window_seconds / 20.0, 0.0, 1.0)
+    sample_confidence = _clamp_number(sample_count_used / 800.0, 0.0, 1.0)
+
+    spo2_percent: float | None = None
+    if red_points:
+        paired_count = min(len(ir_points), len(red_points))
+        red_values = [float(point.get("value") or 0.0) for point in red_points[-paired_count:]]
+        ir_segment_values = ir_values[-paired_count:]
+        if paired_count >= 120:
+            short_window = max(3, int((effective_sample_rate_hz or 25.0) * 0.15))
+            if short_window % 2 == 0:
+                short_window += 1
+            long_window = max(short_window + 2, int((effective_sample_rate_hz or 25.0) * 0.8))
+            if long_window % 2 == 0:
+                long_window += 1
+            smoothed_red = _moving_average(red_values, short_window)
+            smoothed_ir = _moving_average(ir_segment_values, short_window)
+            baseline_red = _moving_average(smoothed_red, long_window)
+            baseline_ir = _moving_average(smoothed_ir, long_window)
+            ac_red = statistics.pstdev([smoothed_red[index] - baseline_red[index] for index in range(len(smoothed_red))])
+            ac_ir = statistics.pstdev([smoothed_ir[index] - baseline_ir[index] for index in range(len(smoothed_ir))])
+            dc_red = statistics.fmean(smoothed_red)
+            dc_ir = statistics.fmean(smoothed_ir)
+            if all(math.isfinite(value) for value in (ac_red, ac_ir, dc_red, dc_ir)) and dc_red > 0 and dc_ir > 0 and ac_red > 0 and ac_ir > 0:
+                ratio = (ac_red / dc_red) / (ac_ir / dc_ir)
+                if math.isfinite(ratio) and 0.2 <= ratio <= 2.2:
+                    spo2_percent = _clamp_number(110.0 - (25.0 * ratio), 70.0, 100.0)
+
+    confidence = 0.2 * duration_confidence + 0.2 * sample_confidence + 0.35 * rhythm_confidence + 0.25 * signal_confidence
+    confidence *= max(0.0, 1.0 - min(0.65, packet_loss_ratio * 6.0))
+    if spo2_percent is None:
+        confidence *= 0.8
+    confidence = _clamp_number(confidence, 0.0, 1.0)
+
+    quality = OPTICAL_FINAL_OPTICAL_QUALITY_POOR
+    if confidence >= 0.8 and packet_loss_ratio <= 0.02 and interval_cv <= 0.18:
+        quality = OPTICAL_FINAL_OPTICAL_QUALITY_GOOD
+    elif confidence >= 0.55:
+        quality = OPTICAL_FINAL_OPTICAL_QUALITY_FAIR
+    elif confidence < 0.2:
+        quality = OPTICAL_FINAL_OPTICAL_QUALITY_INSUFFICIENT
+
+    final_optical.update(
+        {
+            "heart_rate_bpm": _round_number(heart_rate_bpm, 1),
+            "spo2_percent": _round_number(spo2_percent, 1) if spo2_percent is not None else None,
+            "confidence": _round_number(confidence, 4) or 0.0,
+            "quality": quality,
+            "rejection_reason": None if quality != OPTICAL_FINAL_OPTICAL_QUALITY_INSUFFICIENT else "The uploaded raw PPG signal quality was insufficient for a validated final result.",
+        }
+    )
+    return final_optical
+
+
+def _compute_optical_capture_run_analysis(cur, *, run_payload: dict[str, Any]) -> dict[str, Any]:
+    chunk_rows = _list_optical_capture_chunk_rows(cur, run_payload["measurement_run_id"])
+    final_optical = _derive_optical_final_result(run_payload, chunk_rows)
+    return {
+        "measurement_run_id": run_payload["measurement_run_id"],
+        "status": OPTICAL_ANALYSIS_STATUS_COMPLETED,
+        "final_optical": final_optical,
+        "analyzed_at": _utcnow(),
+    }
+
+
+def _resolve_optical_capture_run_analysis(cur, *, run_payload: dict[str, Any]) -> dict[str, Any]:
+    existing_analysis = _fetch_optical_capture_run_analysis(cur, run_payload["measurement_run_id"])
+    if existing_analysis is not None:
+        return existing_analysis
+    if run_payload.get("status") != OPTICAL_RUN_STATUS_STOPPED:
+        return {
+            "measurement_run_id": run_payload["measurement_run_id"],
+            "status": OPTICAL_ANALYSIS_STATUS_PROCESSING,
+            "final_optical": None,
+            "analyzed_at": None,
+        }
+    computed_analysis = _compute_optical_capture_run_analysis(cur, run_payload=run_payload)
+    return _persist_optical_capture_run_analysis(
+        cur,
+        measurement_run_id=run_payload["measurement_run_id"],
+        analysis=computed_analysis,
+    )
+
+
+def _validate_optical_capture_run_create_context(
+    cur,
+    *,
+    patient_user_id: str,
+    session_id: str,
+    encounter_id: str | None,
+    device_external_id: str,
+) -> tuple[str, str | None]:
+    cur.execute(
+        """
+        SELECT id::text
+        FROM devices
+        WHERE device_external_id = %s
+        LIMIT 1
+        """,
+        (device_external_id,),
+    )
+    device_row = cur.fetchone()
+    if not device_row:
+        raise HTTPException(404, "Device not registered")
+
+    (device_id,) = device_row
+
+    cur.execute(
+        """
+        SELECT COALESCE(encounter_id, id)::text,
+               device_id::text
+        FROM user_sessions
+        WHERE id = %s
+          AND user_id = %s
+        LIMIT 1
+        """,
+        (session_id, patient_user_id),
+    )
+    session_row = cur.fetchone()
+    if not session_row:
+        raise HTTPException(404, "Session not found")
+
+    resolved_encounter_id, session_device_id = session_row
+    if session_device_id and session_device_id != device_id:
+        raise HTTPException(400, "session_id does not match device_external_id")
+    if encounter_id and resolved_encounter_id and encounter_id != resolved_encounter_id:
+        raise HTTPException(400, "encounter_id does not match session_id")
+
+    return device_id, resolved_encounter_id or encounter_id
+
+
+def _normalize_ts1_frame_payload(frame: Any, *, fallback_received_at: datetime | None) -> dict[str, Any]:
+    raw_payload = frame if isinstance(frame, dict) else {}
+    parsed_payload = raw_payload.get("parsed") if isinstance(raw_payload.get("parsed"), dict) else {}
+
+    def _frame_value(key: str) -> Any:
+        if key in raw_payload:
+            return raw_payload.get(key)
+        return parsed_payload.get(key)
+
+    received_at = (
+        _parse_datetime_like(_frame_value("received_at"))
+        or _parse_datetime_like(_frame_value("ts"))
+        or _parse_datetime_like(_frame_value("timestamp"))
+        or fallback_received_at
+    )
+    timestamp_ms_value = _as_number(_frame_value("timestamp_ms"))
+    timestamp_ms = int(timestamp_ms_value) if timestamp_ms_value is not None and math.isfinite(timestamp_ms_value) else None
+    checksum_ok = _as_bool(_frame_value("checksum_ok"))
+    raw_line = _coalesce_nonempty(
+        raw_payload.get("raw_line"),
+        raw_payload.get("raw"),
+        raw_payload.get("line"),
+        parsed_payload.get("raw_line"),
+    )
+
+    normalized_fields: dict[str, float] = {}
+    for field_name in OPTICAL_TS1_SERIES_FIELDS:
+        numeric_value = _as_number(_frame_value(field_name))
+        if numeric_value is not None and math.isfinite(numeric_value):
+            normalized_fields[field_name] = float(numeric_value)
+
+    parsed_payload_json = parsed_payload if parsed_payload else {
+        key: value
+        for key, value in raw_payload.items()
+        if key not in {"parsed", "raw_line", "raw", "line"}
+    }
+    parsed_payload_json = jsonable_encoder(parsed_payload_json or {}, exclude_none=True)
+    if timestamp_ms is not None:
+        parsed_payload_json.setdefault("timestamp_ms", timestamp_ms)
+    if received_at is not None:
+        parsed_payload_json.setdefault("received_at", _iso(received_at))
+    if checksum_ok is not None:
+        parsed_payload_json.setdefault("checksum_ok", checksum_ok)
+    for field_name, numeric_value in normalized_fields.items():
+        parsed_payload_json.setdefault(field_name, numeric_value)
+
+    return {
+        "received_at": received_at,
+        "timestamp_ms": timestamp_ms,
+        "raw_line": str(raw_line).strip() if isinstance(raw_line, str) and raw_line.strip() else None,
+        "checksum_ok": checksum_ok,
+        "parsed_payload_json": parsed_payload_json,
+        **normalized_fields,
+    }
+
+
+def _extract_optical_packet_id(packet: dict[str, Any]) -> str | None:
+    value = _coalesce_nonempty(
+        packet.get("packet_id"),
+        packet.get("packetId"),
+        packet.get("id"),
+        packet.get("seq"),
+        packet.get("sequence"),
+    )
+    if value is None:
+        return None
+    return str(value)
+
+
+def _optical_ppg_series_arrays(packet: dict[str, Any]) -> dict[str, list[Any]]:
+    arrays: dict[str, list[Any]] = {}
+    candidate_maps = [packet]
+    for nested_key in ("channels", "values", "ppg"):
+        nested = packet.get(nested_key)
+        if isinstance(nested, dict):
+            candidate_maps.append(nested)
+
+    for series_name, aliases in OPTICAL_PPG_SERIES_ALIASES.items():
+        for candidate in candidate_maps:
+            for alias in aliases:
+                values = candidate.get(alias)
+                if isinstance(values, list):
+                    arrays[series_name] = values
+                    break
+            if series_name in arrays:
+                break
+
+    return arrays
+
+
+def _optical_ppg_value_from_mapping(mapping: Any, series_name: str) -> float | None:
+    if not isinstance(mapping, dict):
+        return None
+
+    for alias in OPTICAL_PPG_SERIES_ALIASES.get(series_name, ()):
+        numeric_value = _as_number(mapping.get(alias))
+        if numeric_value is not None and math.isfinite(numeric_value):
+            return float(numeric_value)
+
+    for nested_key in ("values", "channels", "ppg"):
+        nested = mapping.get(nested_key)
+        if not isinstance(nested, dict):
+            continue
+        for alias in OPTICAL_PPG_SERIES_ALIASES.get(series_name, ()):
+            numeric_value = _as_number(nested.get(alias))
+            if numeric_value is not None and math.isfinite(numeric_value):
+                return float(numeric_value)
+
+    return None
+
+
+def _estimate_optical_ppg_packet_sample_count(packet: Any) -> int:
+    if not isinstance(packet, dict):
+        return 0
+
+    explicit_count = _as_number(
+        _coalesce_nonempty(
+            packet.get("sample_count"),
+            packet.get("sampleCount"),
+            packet.get("samples_per_packet"),
+        )
+    )
+    if explicit_count is not None and explicit_count >= 0:
+        return int(explicit_count)
+
+    samples = packet.get("samples")
+    if isinstance(samples, list):
+        return len(samples)
+
+    arrays = _optical_ppg_series_arrays(packet)
+    if arrays:
+        return max(len(values) for values in arrays.values())
+
+    values = packet.get("values")
+    if isinstance(values, list):
+        return len(values)
+
+    for series_name in OPTICAL_PPG_SERIES_KEYS:
+        if _optical_ppg_value_from_mapping(packet, series_name) is not None:
+            return 1
+
+    return 0
+
+
+def _optical_packet_base_datetime(
+    packet: dict[str, Any],
+    *,
+    fallback_start: datetime | None,
+) -> tuple[datetime | None, int | None]:
+    for key in ("received_at", "packet_received_at", "started_at", "packet_started_at", "ts", "timestamp"):
+        parsed = _parse_datetime_like(packet.get(key))
+        if parsed is not None:
+            return parsed, None
+
+    for key in ("timestamp_ms", "packet_timestamp_ms", "base_timestamp_ms", "start_timestamp_ms", "ts_ms"):
+        raw_timestamp = _as_number(packet.get(key))
+        if raw_timestamp is None or not math.isfinite(raw_timestamp):
+            continue
+        timestamp_ms = int(raw_timestamp)
+        parsed = _parse_epoch_datetime(timestamp_ms)
+        if parsed is not None:
+            return parsed, timestamp_ms
+        return fallback_start, timestamp_ms
+
+    return fallback_start, None
+
+
+def _optical_packet_timestamp_list(packet: dict[str, Any]) -> list[Any] | None:
+    for key in ("sample_timestamps_ms", "timestamps_ms", "sample_timestamps", "timestamps", "time_offsets_ms"):
+        values = packet.get(key)
+        if isinstance(values, list):
+            return values
+    return None
+
+
+def _append_optical_waveform_point(
+    target: list[dict[str, Any]],
+    *,
+    point_dt: datetime | None,
+    value: float | None,
+    from_dt: datetime | None,
+    to_dt: datetime | None,
+    metadata: dict[str, Any],
+) -> None:
+    if point_dt is None or value is None:
+        return
+    if from_dt is not None and point_dt < from_dt:
+        return
+    if to_dt is not None and point_dt > to_dt:
+        return
+
+    target.append(
+        {
+            "_dt": point_dt,
+            "ts": _iso(point_dt),
+            "value": float(value),
+            **metadata,
+        }
+    )
+
+
+def _make_optical_waveform_gap(
+    *,
+    reason: str,
+    start_ts: str | None,
+    end_ts: str | None,
+    gap_ms: float | None = None,
+    expected_interval_ms: float | None = None,
+    chunk_index: int | None = None,
+    packet_loss_count_delta: int | None = None,
+) -> dict[str, Any]:
+    return {
+        "kind": "gap",
+        "reason": reason,
+        "start_ts": start_ts,
+        "end_ts": end_ts,
+        "gap_ms": round(float(gap_ms), 3) if gap_ms is not None else None,
+        "expected_interval_ms": round(float(expected_interval_ms), 3) if expected_interval_ms is not None else None,
+        "chunk_index": chunk_index,
+        "packet_loss_count_delta": packet_loss_count_delta,
+    }
+
+
+def _extract_optical_ppg_points(
+    chunk_rows: list[Any],
+    *,
+    sample_rate_hz: float | None,
+    from_dt: datetime | None,
+    to_dt: datetime | None,
+) -> tuple[dict[str, list[dict[str, Any]]], dict[str, list[dict[str, Any]]]]:
+    points_by_series: dict[str, list[dict[str, Any]]] = {series_name: [] for series_name in OPTICAL_PPG_SERIES_KEYS}
+    extra_gaps: dict[str, list[dict[str, Any]]] = {series_name: [] for series_name in OPTICAL_PPG_SERIES_KEYS}
+
+    for chunk_row in chunk_rows:
+        chunk_index = int(chunk_row[0])
+        chunk_started_at = chunk_row[1] or chunk_row[2]
+        chunk_ended_at = chunk_row[2] or chunk_row[1]
+        packet_loss_count_delta = int(chunk_row[7] or 0)
+        payload_json = chunk_row[8] if isinstance(chunk_row[8], dict) else {}
+        ppg_packets = payload_json.get("ppg_packets") if isinstance(payload_json.get("ppg_packets"), list) else []
+
+        if packet_loss_count_delta > 0:
+            gap_marker = _make_optical_waveform_gap(
+                reason="packet_loss",
+                start_ts=_iso(chunk_started_at),
+                end_ts=_iso(chunk_ended_at),
+                chunk_index=chunk_index,
+                packet_loss_count_delta=packet_loss_count_delta,
+            )
+            for series_name in OPTICAL_PPG_SERIES_KEYS:
+                extra_gaps[series_name].append(dict(gap_marker))
+
+        chunk_sample_offset = 0
+        for packet_offset, packet in enumerate(ppg_packets):
+            if not isinstance(packet, dict):
+                continue
+
+            packet_sample_count = _estimate_optical_ppg_packet_sample_count(packet)
+            fallback_packet_start = None
+            if chunk_started_at is not None and sample_rate_hz and sample_rate_hz > 0:
+                fallback_packet_start = chunk_started_at + timedelta(seconds=chunk_sample_offset / sample_rate_hz)
+            else:
+                fallback_packet_start = chunk_started_at
+
+            packet_base_dt, packet_timestamp_ms = _optical_packet_base_datetime(
+                packet,
+                fallback_start=fallback_packet_start,
+            )
+            packet_id = _extract_optical_packet_id(packet)
+            packet_sample_rate_hz = _as_number(
+                _coalesce_nonempty(packet.get("sample_rate_hz"), packet.get("sampleRateHz"), sample_rate_hz)
+            )
+            sample_interval_ms = _as_number(
+                _coalesce_nonempty(packet.get("sample_interval_ms"), packet.get("samplePeriodMs"))
+            )
+            if sample_interval_ms is None and packet_sample_rate_hz is not None and packet_sample_rate_hz > 0:
+                sample_interval_ms = 1000.0 / packet_sample_rate_hz
+
+            timestamp_list = _optical_packet_timestamp_list(packet)
+            emitted_points = 0
+
+            samples = packet.get("samples")
+            if isinstance(samples, list):
+                if samples and all(isinstance(sample, dict) for sample in samples):
+                    for sample_index, sample in enumerate(samples):
+                        sample_dt = (
+                            _parse_datetime_like(sample.get("received_at"))
+                            or _parse_datetime_like(sample.get("ts"))
+                            or _parse_datetime_like(sample.get("timestamp"))
+                        )
+                        raw_sample_timestamp = _as_number(sample.get("timestamp_ms"))
+                        if sample_dt is None and raw_sample_timestamp is not None:
+                            sample_dt = _parse_epoch_datetime(raw_sample_timestamp) or packet_base_dt
+                        if sample_dt is None and timestamp_list and sample_index < len(timestamp_list):
+                            raw_list_timestamp = _as_number(timestamp_list[sample_index])
+                            if raw_list_timestamp is not None:
+                                sample_dt = _parse_epoch_datetime(raw_list_timestamp) or (
+                                    packet_base_dt + timedelta(milliseconds=sample_index * sample_interval_ms)
+                                    if packet_base_dt is not None and sample_interval_ms is not None
+                                    else packet_base_dt
+                                )
+                        if sample_dt is None and packet_base_dt is not None and sample_interval_ms is not None:
+                            sample_dt = packet_base_dt + timedelta(milliseconds=sample_index * sample_interval_ms)
+
+                        timestamp_ms = None
+                        if raw_sample_timestamp is not None and math.isfinite(raw_sample_timestamp):
+                            timestamp_ms = int(raw_sample_timestamp)
+                        elif packet_timestamp_ms is not None and sample_interval_ms is not None:
+                            timestamp_ms = int(packet_timestamp_ms + (sample_index * sample_interval_ms))
+
+                        for series_name in OPTICAL_PPG_SERIES_KEYS:
+                            value = _optical_ppg_value_from_mapping(sample, series_name)
+                            if value is None:
+                                continue
+                            _append_optical_waveform_point(
+                                points_by_series[series_name],
+                                point_dt=sample_dt,
+                                value=value,
+                                from_dt=from_dt,
+                                to_dt=to_dt,
+                                metadata={
+                                    "series": series_name,
+                                    "chunk_index": chunk_index,
+                                    "packet_index": packet_offset,
+                                    "packet_id": packet_id,
+                                    "sample_index": sample_index,
+                                    "timestamp_ms": timestamp_ms,
+                                },
+                            )
+                            emitted_points += 1
+                else:
+                    channel_name = str(packet.get("channel") or packet.get("series") or "").strip().lower()
+                    series_name = None
+                    for candidate_name, aliases in OPTICAL_PPG_SERIES_ALIASES.items():
+                        if channel_name in aliases or channel_name == candidate_name:
+                            series_name = candidate_name
+                            break
+                    if series_name:
+                        for sample_index, sample in enumerate(samples):
+                            numeric_value = _as_number(sample)
+                            if numeric_value is None or not math.isfinite(numeric_value):
+                                continue
+                            sample_dt = packet_base_dt
+                            if sample_dt is not None and sample_interval_ms is not None:
+                                sample_dt = packet_base_dt + timedelta(milliseconds=sample_index * sample_interval_ms)
+                            timestamp_ms = (
+                                int(packet_timestamp_ms + (sample_index * sample_interval_ms))
+                                if packet_timestamp_ms is not None and sample_interval_ms is not None
+                                else packet_timestamp_ms
+                            )
+                            _append_optical_waveform_point(
+                                points_by_series[series_name],
+                                point_dt=sample_dt,
+                                value=float(numeric_value),
+                                from_dt=from_dt,
+                                to_dt=to_dt,
+                                metadata={
+                                    "series": series_name,
+                                    "chunk_index": chunk_index,
+                                    "packet_index": packet_offset,
+                                    "packet_id": packet_id,
+                                    "sample_index": sample_index,
+                                    "timestamp_ms": timestamp_ms,
+                                },
+                            )
+                            emitted_points += 1
+
+            arrays = _optical_ppg_series_arrays(packet)
+            if emitted_points == 0 and arrays:
+                array_length = max(len(values) for values in arrays.values())
+                for sample_index in range(array_length):
+                    sample_dt = None
+                    raw_list_timestamp_value = None
+                    if timestamp_list and sample_index < len(timestamp_list):
+                        raw_list_timestamp_value = _as_number(timestamp_list[sample_index])
+                        if raw_list_timestamp_value is not None:
+                            sample_dt = _parse_epoch_datetime(raw_list_timestamp_value) or packet_base_dt
+                    if sample_dt is None and packet_base_dt is not None and sample_interval_ms is not None:
+                        sample_dt = packet_base_dt + timedelta(milliseconds=sample_index * sample_interval_ms)
+                    if sample_dt is None:
+                        sample_dt = packet_base_dt
+
+                    for series_name, values in arrays.items():
+                        if sample_index >= len(values):
+                            continue
+                        numeric_value = _as_number(values[sample_index])
+                        if numeric_value is None or not math.isfinite(numeric_value):
+                            continue
+                        timestamp_ms = None
+                        if raw_list_timestamp_value is not None and math.isfinite(raw_list_timestamp_value):
+                            timestamp_ms = int(raw_list_timestamp_value)
+                        elif packet_timestamp_ms is not None and sample_interval_ms is not None:
+                            timestamp_ms = int(packet_timestamp_ms + (sample_index * sample_interval_ms))
+                        _append_optical_waveform_point(
+                            points_by_series[series_name],
+                            point_dt=sample_dt,
+                            value=float(numeric_value),
+                            from_dt=from_dt,
+                            to_dt=to_dt,
+                            metadata={
+                                "series": series_name,
+                                "chunk_index": chunk_index,
+                                "packet_index": packet_offset,
+                                "packet_id": packet_id,
+                                "sample_index": sample_index,
+                                "timestamp_ms": timestamp_ms,
+                            },
+                        )
+                        emitted_points += 1
+
+            if emitted_points == 0:
+                for series_name in OPTICAL_PPG_SERIES_KEYS:
+                    numeric_value = _optical_ppg_value_from_mapping(packet, series_name)
+                    if numeric_value is None:
+                        continue
+                    _append_optical_waveform_point(
+                        points_by_series[series_name],
+                        point_dt=packet_base_dt,
+                        value=numeric_value,
+                        from_dt=from_dt,
+                        to_dt=to_dt,
+                        metadata={
+                            "series": series_name,
+                            "chunk_index": chunk_index,
+                            "packet_index": packet_offset,
+                            "packet_id": packet_id,
+                            "sample_index": 0,
+                            "timestamp_ms": packet_timestamp_ms,
+                        },
+                    )
+                    emitted_points += 1
+
+            chunk_sample_offset += max(packet_sample_count, emitted_points, 0)
+
+    for series_name in OPTICAL_PPG_SERIES_KEYS:
+        points_by_series[series_name].sort(key=lambda point: (point["_dt"], point.get("chunk_index") or 0, point.get("sample_index") or 0))
+
+    return points_by_series, extra_gaps
+
+
+def _strip_optical_waveform_points(points: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [{key: value for key, value in point.items() if key != "_dt"} for point in points]
+
+
+def _estimate_optical_interval_ms(points: list[dict[str, Any]], fallback_ms: float | None = None) -> float | None:
+    deltas: list[float] = []
+    previous_dt: datetime | None = None
+    for point in points:
+        point_dt = point.get("_dt")
+        if not isinstance(point_dt, datetime):
+            continue
+        if previous_dt is not None:
+            delta_ms = (point_dt - previous_dt).total_seconds() * 1000.0
+            if delta_ms > 0:
+                deltas.append(delta_ms)
+        previous_dt = point_dt
+
+    if deltas:
+        return float(statistics.median(deltas))
+    return fallback_ms
+
+
+def _detect_optical_waveform_gaps(points: list[dict[str, Any]], *, expected_interval_ms: float | None) -> list[dict[str, Any]]:
+    if expected_interval_ms is None or expected_interval_ms <= 0:
+        return []
+
+    gaps: list[dict[str, Any]] = []
+    previous_point: dict[str, Any] | None = None
+    for point in points:
+        point_dt = point.get("_dt")
+        if not isinstance(point_dt, datetime):
+            continue
+        if previous_point is not None:
+            previous_dt = previous_point.get("_dt")
+            if isinstance(previous_dt, datetime):
+                delta_ms = (point_dt - previous_dt).total_seconds() * 1000.0
+                if delta_ms > expected_interval_ms * 1.5:
+                    gaps.append(
+                        _make_optical_waveform_gap(
+                            reason="time_gap",
+                            start_ts=previous_point.get("ts"),
+                            end_ts=point.get("ts"),
+                            gap_ms=delta_ms,
+                            expected_interval_ms=expected_interval_ms,
+                        )
+                    )
+        previous_point = point
+    return gaps
+
+
+def _optical_point_identity(point: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        point.get("ts"),
+        point.get("value"),
+        point.get("chunk_index"),
+        point.get("packet_index"),
+        point.get("packet_id"),
+        point.get("sample_index"),
+        point.get("frame_index"),
+    )
+
+
+def _optical_gap_identity(gap: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        gap.get("kind"),
+        gap.get("reason"),
+        gap.get("start_ts"),
+        gap.get("end_ts"),
+        gap.get("gap_ms"),
+        gap.get("expected_interval_ms"),
+        gap.get("chunk_index"),
+        gap.get("packet_loss_count_delta"),
+    )
+
+
+def _downsample_optical_points_minmax(points: list[dict[str, Any]], max_points: int) -> tuple[list[dict[str, Any]], bool]:
+    if len(points) <= max_points or max_points < 3:
+        return points, False
+
+    first_point = points[0]
+    last_point = points[-1]
+    interior = points[1:-1]
+    remaining_budget = max_points - 2
+    if remaining_budget <= 0:
+        return [first_point, last_point][:max_points], True
+
+    bucket_count = max(1, math.ceil(len(interior) / max(1, remaining_budget // 2 or 1)))
+    bucket_size = max(1, math.ceil(len(interior) / bucket_count))
+    downsampled: list[dict[str, Any]] = [first_point]
+    seen: set[tuple[Any, ...]] = {_optical_point_identity(first_point)}
+
+    for start in range(0, len(interior), bucket_size):
+        if remaining_budget <= 0:
+            break
+        bucket = interior[start:start + bucket_size]
+        if not bucket:
+            continue
+
+        if len(bucket) == 1 or remaining_budget == 1:
+            candidate = bucket[len(bucket) // 2]
+            identity = _optical_point_identity(candidate)
+            if identity not in seen:
+                downsampled.append(candidate)
+                seen.add(identity)
+                remaining_budget -= 1
+            continue
+
+        min_point = min(bucket, key=lambda point: point["value"])
+        max_point = max(bucket, key=lambda point: point["value"])
+        ordered_candidates = [min_point, max_point]
+        ordered_candidates.sort(key=lambda point: point["_dt"])
+
+        for candidate in ordered_candidates:
+            if remaining_budget <= 0:
+                break
+            identity = _optical_point_identity(candidate)
+            if identity in seen:
+                continue
+            downsampled.append(candidate)
+            seen.add(identity)
+            remaining_budget -= 1
+
+    last_identity = _optical_point_identity(last_point)
+    if last_identity not in seen:
+        if len(downsampled) >= max_points:
+            downsampled[-1] = last_point
+        else:
+            downsampled.append(last_point)
+
+    return downsampled[:max_points], True
+
+
+def _parse_optical_resolution_ms(value: str | None) -> float | None:
+    if value is None:
+        return None
+    token = value.strip().lower()
+    if not token or token == "raw":
+        return None
+
+    try:
+        if token.endswith("ms"):
+            return float(token[:-2])
+        if token.endswith("s"):
+            return float(token[:-1]) * 1000.0
+        if token.endswith("m"):
+            return float(token[:-1]) * 60_000.0
+        return float(token)
+    except ValueError:
+        raise HTTPException(400, "resolution must be numeric or use units like 250ms or 1s")
+
+
+def _parse_optical_series_query(value: str | None) -> list[str]:
+    if value is None or not value.strip():
+        return []
+
+    result: list[str] = []
+    seen: set[str] = set()
+    for token in value.split(","):
+        normalized = token.strip().lower()
+        if not normalized or normalized in seen:
+            continue
+        if normalized in OPTICAL_PPG_SERIES_KEYS:
+            result.append(normalized)
+            seen.add(normalized)
+            continue
+        if normalized.startswith("ts1_") and normalized[4:] in OPTICAL_TS1_SERIES_FIELDS:
+            result.append(normalized)
+            seen.add(normalized)
+            continue
+        raise HTTPException(400, f"Unsupported series '{normalized}'")
+    return result
+
+
+def _compute_optical_waveform_delta(previous_payload: dict[str, Any], current_payload: dict[str, Any]) -> dict[str, Any]:
+    previous_series_by_name = {
+        item.get("series"): item
+        for item in previous_payload.get("series") or []
+        if isinstance(item, dict) and isinstance(item.get("series"), str)
+    }
+
+    delta_series: list[dict[str, Any]] = []
+    for current_series in current_payload.get("series") or []:
+        if not isinstance(current_series, dict):
+            continue
+        series_name = current_series.get("series")
+        if not isinstance(series_name, str):
+            continue
+
+        previous_series = previous_series_by_name.get(series_name) or {}
+        previous_point_ids = {
+            _optical_point_identity(point)
+            for point in previous_series.get("points") or []
+            if isinstance(point, dict)
+        }
+        previous_gap_ids = {
+            _optical_gap_identity(gap)
+            for gap in previous_series.get("gaps") or []
+            if isinstance(gap, dict)
+        }
+
+        new_points = [
+            point
+            for point in current_series.get("points") or []
+            if isinstance(point, dict) and _optical_point_identity(point) not in previous_point_ids
+        ]
+        new_gaps = [
+            gap
+            for gap in current_series.get("gaps") or []
+            if isinstance(gap, dict) and _optical_gap_identity(gap) not in previous_gap_ids
+        ]
+
+        if new_points or new_gaps:
+            delta_series.append(
+                {
+                    "series": series_name,
+                    "kind": current_series.get("kind"),
+                    "label": current_series.get("label"),
+                    "unit": current_series.get("unit"),
+                    "points": new_points,
+                    "gaps": new_gaps,
+                    "meta": current_series.get("meta") or {},
+                }
+            )
+
+    return {
+        "measurement_run_id": current_payload.get("measurement_run_id"),
+        "run": current_payload.get("run"),
+        "filters": current_payload.get("filters") or {},
+        "available_series": current_payload.get("available_series") or [],
+        "series": delta_series,
+        "delta": True,
+    }
+
+
+def _build_optical_waveform_payload(
+    cur,
+    *,
+    measurement_run_id: str,
+    from_dt: datetime | None,
+    to_dt: datetime | None,
+    max_points: int,
+    requested_series: list[str],
+    resolution_ms: float | None,
+) -> dict[str, Any]:
+    run_row = _fetch_optical_capture_run_row(cur, measurement_run_id)
+    if not run_row:
+        raise HTTPException(404, "Optical capture run not found")
+    run_payload = _serialize_optical_capture_run_row(run_row)
+
+    cur.execute(
+        """
+        SELECT chunk_index,
+               chunk_started_at,
+               chunk_ended_at,
+               packet_count,
+               sample_count,
+               first_packet_id,
+               last_packet_id,
+               packet_loss_count_delta,
+               payload_json
+        FROM optical_capture_chunks
+        WHERE measurement_run_id = %s
+          AND (%s::timestamptz IS NULL OR COALESCE(chunk_ended_at, chunk_started_at) >= %s::timestamptz)
+          AND (%s::timestamptz IS NULL OR COALESCE(chunk_started_at, chunk_ended_at) <= %s::timestamptz)
+        ORDER BY chunk_started_at ASC NULLS FIRST, chunk_index ASC
+        """,
+        (measurement_run_id, from_dt, from_dt, to_dt, to_dt),
+    )
+    chunk_rows = cur.fetchall()
+    chunk_started_by_index = {
+        int(row[0]): (row[1] or row[2] or run_payload.get("started_at"))
+        for row in chunk_rows
+    }
+
+    ppg_points_by_series, ppg_extra_gaps = _extract_optical_ppg_points(
+        chunk_rows,
+        sample_rate_hz=run_payload.get("sample_rate_hz"),
+        from_dt=from_dt,
+        to_dt=to_dt,
+    )
+
+    cur.execute(
+        """
+        SELECT chunk_index,
+               frame_index,
+               received_at,
+               timestamp_ms,
+               raw_line,
+               checksum_ok,
+               sht_temp_c,
+               sht_rh_percent,
+               ens_iaq,
+               ens_eco2_ppm,
+               ens_temp_c,
+               mlx_ambient_c,
+               mlx_object_c,
+               heart_rate_bpm,
+               spo2_percent,
+               red_dc,
+               quality,
+               parsed_payload_json
+        FROM optical_capture_ts1_frames
+        WHERE measurement_run_id = %s
+        ORDER BY received_at ASC NULLS LAST, chunk_index ASC, frame_index ASC
+        """,
+        (measurement_run_id,),
+    )
+    ts1_rows = cur.fetchall()
+
+    ts1_points_by_field: dict[str, list[dict[str, Any]]] = {field_name: [] for field_name in OPTICAL_TS1_SERIES_FIELDS}
+    for row in ts1_rows:
+        chunk_index = int(row[0])
+        frame_index = int(row[1])
+        received_at = row[2] if isinstance(row[2], datetime) else None
+        timestamp_ms = int(row[3]) if row[3] is not None else None
+        point_dt = received_at or _parse_epoch_datetime(timestamp_ms) or chunk_started_by_index.get(chunk_index)
+        if point_dt is None:
+            continue
+        if from_dt is not None and point_dt < from_dt:
+            continue
+        if to_dt is not None and point_dt > to_dt:
+            continue
+
+        field_values = {
+            "sht_temp_c": _as_number(row[6]),
+            "sht_rh_percent": _as_number(row[7]),
+            "ens_iaq": _as_number(row[8]),
+            "ens_eco2_ppm": _as_number(row[9]),
+            "ens_temp_c": _as_number(row[10]),
+            "mlx_ambient_c": _as_number(row[11]),
+            "mlx_object_c": _as_number(row[12]),
+            "heart_rate_bpm": _as_number(row[13]),
+            "spo2_percent": _as_number(row[14]),
+            "red_dc": _as_number(row[15]),
+            "quality": _as_number(row[16]),
+        }
+        for field_name, numeric_value in field_values.items():
+            if numeric_value is None or not math.isfinite(numeric_value):
+                continue
+            ts1_points_by_field[field_name].append(
+                {
+                    "_dt": point_dt,
+                    "ts": _iso(point_dt),
+                    "value": float(numeric_value),
+                    "series": f"ts1_{field_name}",
+                    "chunk_index": chunk_index,
+                    "frame_index": frame_index,
+                    "timestamp_ms": timestamp_ms,
+                    "checksum_ok": row[5],
+                    "raw_line": row[4],
+                }
+            )
+
+    for field_name in OPTICAL_TS1_SERIES_FIELDS:
+        ts1_points_by_field[field_name].sort(key=lambda point: (point["_dt"], point.get("chunk_index") or 0, point.get("frame_index") or 0))
+
+    available_series: list[str] = []
+    for series_name in OPTICAL_PPG_SERIES_KEYS:
+        if ppg_points_by_series.get(series_name):
+            available_series.append(series_name)
+    for field_name in OPTICAL_TS1_SERIES_FIELDS:
+        if ts1_points_by_field.get(field_name):
+            available_series.append(f"ts1_{field_name}")
+
+    selected_series = requested_series or available_series
+    waveform_series: list[dict[str, Any]] = []
+
+    for series_name in selected_series:
+        if series_name in OPTICAL_PPG_SERIES_KEYS:
+            original_points = ppg_points_by_series.get(series_name) or []
+            if not original_points:
+                waveform_series.append(
+                    {
+                        "series": series_name,
+                        "kind": "ppg",
+                        "label": "PPG IR" if series_name == "ppg_ir" else "PPG Red",
+                        "points": [],
+                        "gaps": list(ppg_extra_gaps.get(series_name) or []),
+                        "meta": {
+                            "original_point_count": 0,
+                            "returned_point_count": 0,
+                            "downsampled": False,
+                            "sample_rate_hz": run_payload.get("sample_rate_hz"),
+                        },
+                    }
+                )
+                continue
+
+            points_for_response = list(original_points)
+            if resolution_ms is not None and resolution_ms > 0:
+                points_for_response, _ = _downsample_optical_points_minmax(points_for_response, max_points)
+            else:
+                points_for_response, _ = _downsample_optical_points_minmax(points_for_response, max_points)
+            expected_interval_ms = _estimate_optical_interval_ms(
+                original_points,
+                fallback_ms=(1000.0 / run_payload["sample_rate_hz"]) if run_payload.get("sample_rate_hz") else None,
+            )
+            gaps = _detect_optical_waveform_gaps(original_points, expected_interval_ms=expected_interval_ms)
+            gaps.extend(list(ppg_extra_gaps.get(series_name) or []))
+            waveform_series.append(
+                {
+                    "series": series_name,
+                    "kind": "ppg",
+                    "label": "PPG IR" if series_name == "ppg_ir" else "PPG Red",
+                    "points": _strip_optical_waveform_points(points_for_response),
+                    "gaps": gaps,
+                    "meta": {
+                        "original_point_count": len(original_points),
+                        "returned_point_count": len(points_for_response),
+                        "downsampled": len(points_for_response) < len(original_points),
+                        "sample_rate_hz": run_payload.get("sample_rate_hz"),
+                    },
+                }
+            )
+            continue
+
+        field_name = series_name[4:]
+        original_points = ts1_points_by_field.get(field_name) or []
+        returned_points = list(original_points)
+        if len(returned_points) > max_points:
+            stride = max(1, math.ceil(len(returned_points) / max_points))
+            returned_points = returned_points[::stride][:max_points]
+        expected_interval_ms = _estimate_optical_interval_ms(original_points)
+        waveform_series.append(
+            {
+                "series": series_name,
+                "kind": "ts1",
+                "label": OPTICAL_TS1_SERIES_LABELS.get(series_name, series_name),
+                "points": _strip_optical_waveform_points(returned_points),
+                "gaps": _detect_optical_waveform_gaps(original_points, expected_interval_ms=expected_interval_ms),
+                "meta": {
+                    "original_point_count": len(original_points),
+                    "returned_point_count": len(returned_points),
+                    "downsampled": len(returned_points) < len(original_points),
+                },
+            }
+        )
+
+    return {
+        "measurement_run_id": measurement_run_id,
+        "run": run_payload,
+        "filters": {
+            "from_ts": _iso(from_dt),
+            "to_ts": _iso(to_dt),
+            "max_points": max_points,
+            "series": selected_series,
+            "resolution_ms": resolution_ms,
+        },
+        "available_series": available_series,
+        "series": waveform_series,
+    }
+
+
 def _build_doctor_encounter_summaries(
     measurement_sessions: list[dict[str, Any]],
     image_history_items: list[dict[str, Any]],
@@ -6907,6 +8681,8 @@ def _build_doctor_encounter_summaries(
             "tag_count": 0,
             "measurement_ids": [],
             "latest_measurement_id": None,
+            "latest_measurement_label": None,
+            "latest_measurement_mode": None,
             "latest_source": None,
             "device_name": None,
             "location_label": None,
@@ -6917,7 +8693,10 @@ def _build_doctor_encounter_summaries(
             "disposition": None,
             "follow_up_plan": None,
             "tags": [],
+            "measurement_modes": [],
             "linked_measurement_run_ids": [],
+            "waveform_measurement_run_ids": [],
+            "has_waveform_measurements": False,
             "linked_image_ids": [],
             "linked_report_ids": [],
             "linked_message_ids": [],
@@ -6949,17 +8728,36 @@ def _build_doctor_encounter_summaries(
         measurement_id = session.get("measurement_id")
         if isinstance(measurement_id, str) and measurement_id and measurement_id not in item["measurement_ids"]:
             item["measurement_ids"].append(measurement_id)
+        measurement_mode = session.get("measurement_mode")
+        if isinstance(measurement_mode, str) and measurement_mode and measurement_mode not in item["measurement_modes"]:
+            item["measurement_modes"].append(measurement_mode)
         measurement_run_id = session.get("measurement_run_id")
         if isinstance(measurement_run_id, str) and measurement_run_id and measurement_run_id not in item["linked_measurement_run_ids"]:
             item["linked_measurement_run_ids"].append(measurement_run_id)
+            if (
+                session.get("raw_waveform_available")
+                or isinstance(session.get("waveform_api_path"), str)
+                or isinstance(session.get("waveform_stream_path"), str)
+            ) and measurement_run_id not in item["waveform_measurement_run_ids"]:
+                item["waveform_measurement_run_ids"].append(measurement_run_id)
+                item["has_waveform_measurements"] = True
         for run_id in session.get("measurement_run_ids") or []:
             if isinstance(run_id, str) and run_id and run_id not in item["linked_measurement_run_ids"]:
                 item["linked_measurement_run_ids"].append(run_id)
+                if (
+                    session.get("raw_waveform_available")
+                    or isinstance(session.get("waveform_api_path"), str)
+                    or isinstance(session.get("waveform_stream_path"), str)
+                ) and run_id not in item["waveform_measurement_run_ids"]:
+                    item["waveform_measurement_run_ids"].append(run_id)
+                    item["has_waveform_measurements"] = True
 
         latest_dt = ended_dt or started_dt
         if item["_latest_dt"] is None or (latest_dt is not None and latest_dt >= item["_latest_dt"]):
             item["_latest_dt"] = latest_dt
             item["latest_measurement_id"] = measurement_id if isinstance(measurement_id, str) else None
+            item["latest_measurement_label"] = session.get("measurement_label") if isinstance(session.get("measurement_label"), str) else None
+            item["latest_measurement_mode"] = measurement_mode if isinstance(measurement_mode, str) else None
             item["latest_source"] = session.get("source") if isinstance(session.get("source"), str) else None
             item["device_name"] = session.get("device_name") if isinstance(session.get("device_name"), str) else None
             item["location_label"] = session.get("location_label") if isinstance(session.get("location_label"), str) else None
@@ -7349,6 +9147,37 @@ def build_measurement_history(user_id: str, limit: int, *, include_messages: boo
         )
         sensor_analysis_rows = cur.fetchall()
 
+        cur.execute(
+            """
+            SELECT o.measurement_run_id::text,
+                   o.patient_user_id::text,
+                   COALESCE(o.encounter_id::text, us.encounter_id::text, us.id::text),
+                   o.session_id::text,
+                   o.device_external_id,
+                   o.mode,
+                   o.status,
+                   o.started_at,
+                   o.stopped_at,
+                   o.sample_rate_hz,
+                   o.requested_measurements,
+                   o.raw_waveform_available,
+                   o.total_chunks,
+                   o.total_packets,
+                   o.total_samples,
+                   o.ts1_frame_count,
+                   o.packet_loss_count,
+                   o.checksum_failure_count,
+                   o.malformed_packet_count,
+                   o.latest_chunk_at
+            FROM optical_capture_runs o
+            LEFT JOIN user_sessions us ON us.id = o.session_id
+            WHERE o.patient_user_id = %s
+            ORDER BY o.started_at ASC, o.measurement_run_id ASC
+            """,
+            (validated_user_id,),
+        )
+        optical_run_rows = cur.fetchall()
+
     encounters: dict[str, dict[str, Any]] = {}
     session_index: dict[str, dict[str, Any]] = {}
     min_dt = datetime.min.replace(tzinfo=timezone.utc)
@@ -7619,6 +9448,98 @@ def build_measurement_history(user_id: str, limit: int, *, include_messages: boo
             sensor_analysis_ts_by_run_id[measurement_run_id] = analyzed_dt
             sensor_analysis_by_run_id[measurement_run_id] = analysis_payload
 
+    optical_history_rows: list[dict[str, Any]] = []
+    optical_run_by_measurement_run_id: dict[str, dict[str, Any]] = {}
+    for optical_run_row in optical_run_rows:
+        optical_run = _serialize_optical_capture_run_row(optical_run_row)
+        optical_run_by_measurement_run_id[str(optical_run.get("measurement_run_id") or "")] = optical_run
+        encounter_id = optical_run.get("encounter_id")
+        if not isinstance(encounter_id, str) or not encounter_id:
+            continue
+
+        encounter = ensure_encounter(encounter_id)
+        run_started_at = optical_run.get("started_at")
+        run_last_dt = optical_run.get("latest_chunk_at") or optical_run.get("stopped_at") or run_started_at
+        touch(encounter, run_started_at if isinstance(run_started_at, datetime) else None)
+        touch(encounter, run_last_dt if isinstance(run_last_dt, datetime) else None)
+
+        device_name = optical_run.get("device_external_id") or encounter.get("device_name")
+        if not encounter["device_name"] and device_name:
+            encounter["device_name"] = device_name
+
+        session_id = optical_run.get("session_id")
+        session_info = session_index.get(session_id) if isinstance(session_id, str) else None
+        if session_info is not None:
+            session_info["has_sensor_events"] = True
+            if isinstance(run_last_dt, datetime) and (
+                session_info["last_sensor_ts"] is None or run_last_dt > session_info["last_sensor_ts"]
+            ):
+                session_info["last_sensor_ts"] = run_last_dt
+            if not session_info.get("device_name") and device_name:
+                session_info["device_name"] = device_name
+
+        location_label = device_name or encounter.get("device_name")
+        row = {
+            "encounter_id": encounter["encounter_id"],
+            "user_id": validated_user_id,
+            "chat_session_id": encounter.get("chat_session_id"),
+            "measurement_session_id": session_id or encounter.get("measurement_session_id"),
+            "measurement_run_id": optical_run["measurement_run_id"],
+            "measurement_run_ids": [optical_run["measurement_run_id"]],
+            "measurement_id": OPTICAL_MEASUREMENT_ID,
+            "measurement_mode": optical_run.get("mode"),
+            "measurement_label": OPTICAL_MEASUREMENT_LABEL,
+            "source": "optical_waveform_capture",
+            "is_user_selected": True,
+            "started_at": _iso(run_started_at),
+            "ended_at": _iso(optical_run.get("stopped_at") or run_last_dt),
+            "device_name": device_name,
+            "capture_status": optical_run.get("status"),
+            "raw_waveform_available": optical_run.get("raw_waveform_available"),
+            "sample_rate_hz": optical_run.get("sample_rate_hz"),
+            "packet_loss_count": optical_run.get("packet_loss_count"),
+            "ts1_frame_count": optical_run.get("ts1_frame_count"),
+            "total_chunks": optical_run.get("total_chunks"),
+            "total_packets": optical_run.get("total_packets"),
+            "total_samples": optical_run.get("total_samples"),
+            "checksum_failure_count": optical_run.get("checksum_failure_count"),
+            "malformed_packet_count": optical_run.get("malformed_packet_count"),
+            "requested_measurements": list(optical_run.get("requested_measurements") or []),
+            "waveform_api_path": optical_run.get("waveform_api_path"),
+            "waveform_stream_path": optical_run.get("waveform_stream_path"),
+            "feelings": list(encounter.get("feelings") or []),
+            "notes": encounter.get("notes"),
+            "chat_result": encounter.get("chat_result"),
+            "messages": list(encounter.get("messages") or []) if include_messages else [],
+            "summary": {},
+            "location_label": location_label,
+            "capture_location": location_label,
+            "_sort_dt": run_last_dt or run_started_at or encounter.get("_sort_dt") or min_dt,
+        }
+
+        linked_sensor_analysis = sensor_analysis_by_run_id.get(optical_run["measurement_run_id"])
+        if linked_sensor_analysis is not None:
+            row["analysis"] = linked_sensor_analysis
+            row["analysis_result"] = linked_sensor_analysis
+            row["sensor_analysis"] = linked_sensor_analysis
+            row["findings"] = list(
+                linked_sensor_analysis.get("patient_findings")
+                or _analysis_findings_text(linked_sensor_analysis.get("findings"))
+            )
+
+        linked_visual_analysis = visual_analysis_by_run_id.get(optical_run["measurement_run_id"])
+        if linked_visual_analysis is not None:
+            row["visual_analysis"] = linked_visual_analysis
+            if linked_sensor_analysis is None:
+                row["analysis"] = linked_visual_analysis
+                row["analysis_result"] = linked_visual_analysis
+                row["findings"] = list(
+                    linked_visual_analysis.get("patient_findings")
+                    or _analysis_findings_text(linked_visual_analysis.get("findings"))
+                )
+
+        optical_history_rows.append(row)
+
     sessions: list[dict[str, Any]] = []
 
     def session_sort_key(session_info: dict[str, Any]) -> datetime:
@@ -7666,6 +9587,29 @@ def build_measurement_history(user_id: str, limit: int, *, include_messages: boo
         if summary_key and group.get("summary_value") is not None:
             summary[summary_key] = _round_number(_as_number(group.get("summary_value")))
 
+        linked_optical_run = optical_run_by_measurement_run_id.get(str(group.get("measurement_run_id") or ""))
+        linked_waveform_available = bool(linked_optical_run.get("raw_waveform_available")) if linked_optical_run else False
+        linked_waveform_api_path = linked_optical_run.get("waveform_api_path") if linked_optical_run else None
+        linked_waveform_stream_path = linked_optical_run.get("waveform_stream_path") if linked_optical_run else None
+        linked_capture_status = linked_optical_run.get("status") if linked_optical_run else None
+        linked_sample_rate_hz = linked_optical_run.get("sample_rate_hz") if linked_optical_run else None
+        linked_packet_loss_count = linked_optical_run.get("packet_loss_count") if linked_optical_run else None
+        linked_ts1_frame_count = linked_optical_run.get("ts1_frame_count") if linked_optical_run else None
+        linked_total_chunks = linked_optical_run.get("total_chunks") if linked_optical_run else None
+        linked_total_packets = linked_optical_run.get("total_packets") if linked_optical_run else None
+        linked_total_samples = linked_optical_run.get("total_samples") if linked_optical_run else None
+        linked_checksum_failure_count = linked_optical_run.get("checksum_failure_count") if linked_optical_run else None
+        linked_malformed_packet_count = linked_optical_run.get("malformed_packet_count") if linked_optical_run else None
+        linked_requested_measurements = list(linked_optical_run.get("requested_measurements") or []) if linked_optical_run else []
+
+        measurement_mode = OPTICAL_MEASUREMENT_MODE if linked_optical_run else STANDARD_OPTICAL_MEASUREMENT_MODE
+        measurement_label = None
+        trend_spec = TREND_SERIES_SPECS.get(group["measurement_id"]) or {}
+        if isinstance(trend_spec, dict):
+            candidate_label = trend_spec.get("label")
+            if isinstance(candidate_label, str) and candidate_label.strip():
+                measurement_label = candidate_label.strip()
+
         row_source = "measurement_capture" if group.get("is_user_selected") is not False else "background_telemetry"
         # Location label logic: prefer device_name, fallback to None
         location_label = group.get("device_name") or encounter.get("device_name")
@@ -7677,11 +9621,26 @@ def build_measurement_history(user_id: str, limit: int, *, include_messages: boo
             "measurement_run_id": group["measurement_run_id"],
             "measurement_run_ids": [group["measurement_run_id"]],
             "measurement_id": group["measurement_id"],
+            "measurement_mode": measurement_mode,
+            "measurement_label": measurement_label,
             "source": row_source,
             "is_user_selected": bool(group.get("is_user_selected", True)),
             "started_at": _iso(group.get("_started_dt")),
             "ended_at": _iso(group.get("_ended_dt")),
             "device_name": group.get("device_name") or encounter.get("device_name"),
+            "capture_status": linked_capture_status,
+            "raw_waveform_available": linked_waveform_available,
+            "sample_rate_hz": linked_sample_rate_hz,
+            "packet_loss_count": linked_packet_loss_count,
+            "ts1_frame_count": linked_ts1_frame_count,
+            "total_chunks": linked_total_chunks,
+            "total_packets": linked_total_packets,
+            "total_samples": linked_total_samples,
+            "checksum_failure_count": linked_checksum_failure_count,
+            "malformed_packet_count": linked_malformed_packet_count,
+            "requested_measurements": linked_requested_measurements,
+            "waveform_api_path": linked_waveform_api_path,
+            "waveform_stream_path": linked_waveform_stream_path,
             "feelings": list(encounter.get("feelings") or []),
             "notes": encounter.get("notes"),
             "chat_result": encounter.get("chat_result"),
@@ -7715,6 +9674,7 @@ def build_measurement_history(user_id: str, limit: int, *, include_messages: boo
 
         sessions.append(row)
 
+    sessions.extend(optical_history_rows)
     sessions.extend(visual_history_rows)
 
     sessions.sort(
@@ -7734,6 +9694,34 @@ def build_measurement_trends(user_id: str) -> dict[str, Any]:
     except ValueError as exc:
         raise HTTPException(400, "user_id must be a valid UUID") from exc
 
+    measurement_summary_keys = {
+        "temperature": "skin_temperature_c",
+        "ambient_temperature": "ambient_temperature_c",
+        "spo2": "spo2_percent",
+        "heart_rate": "heart_rate_bpm",
+        "humidity": "humidity_percent",
+        "co2": "co2_ppm",
+    }
+
+    canonical_points: dict[tuple[str, str], dict[str, Any]] = {}
+    canonical_optical_run_metric_keys: set[tuple[str, str]] = set()
+
+    def _put_point(*, trend_kind: str, run_id: str, ts: datetime, value: float, encounter_id: str | None) -> None:
+        key = (trend_kind, run_id)
+        existing = canonical_points.get(key)
+        if existing is not None:
+            existing_ts = existing.get("_ts")
+            if isinstance(existing_ts, datetime) and existing_ts >= ts:
+                return
+        canonical_points[key] = {
+            "kind": trend_kind,
+            "measurement_run_id": run_id,
+            "_ts": ts,
+            "ts": _iso_utc(ts),
+            "value": value,
+            "encounter_id": encounter_id,
+        }
+
     with db() as conn, conn.cursor() as cur:
         cur.execute("SELECT 1 FROM users WHERE id=%s LIMIT 1;", (validated_user_id,))
         if not cur.fetchone():
@@ -7741,56 +9729,130 @@ def build_measurement_trends(user_id: str) -> dict[str, Any]:
 
         cur.execute(
             """
-            SELECT COALESCE(se.encounter_id, us.encounter_id, us.id)::text,
-                   se.ts,
-                   se.kind,
-                   se.data
-            FROM sensor_events se
-            LEFT JOIN user_sessions us ON us.id = se.session_id
-            WHERE (
-                us.user_id = %s
-                OR (
-                    se.session_id IS NULL
-                    AND se.encounter_id IS NOT NULL
-                    AND EXISTS (
-                        SELECT 1
-                        FROM user_sessions ux
-                        WHERE ux.user_id = %s
-                          AND ux.encounter_id = se.encounter_id
-                    )
-                )
-            )
-            ORDER BY se.ts ASC, se.id ASC
+            SELECT o.measurement_run_id::text,
+                   COALESCE(o.encounter_id::text, us.encounter_id::text, us.id::text),
+                   oa.status,
+                   oa.analysis_payload,
+                   oa.analyzed_at
+            FROM optical_capture_runs o
+            LEFT JOIN user_sessions us ON us.id = o.session_id
+            LEFT JOIN optical_capture_run_analysis oa ON oa.measurement_run_id = o.measurement_run_id
+            WHERE o.patient_user_id = %s
+            ORDER BY COALESCE(oa.analyzed_at, o.stopped_at, o.latest_chunk_at, o.started_at) ASC,
+                     o.measurement_run_id ASC
             """,
-            (validated_user_id, validated_user_id),
+            (validated_user_id,),
         )
-        rows = cur.fetchall()
+        optical_analysis_rows = cur.fetchall()
+
+    for measurement_run_id, encounter_id, status, analysis_payload, analyzed_at in optical_analysis_rows:
+        if not isinstance(measurement_run_id, str) or not measurement_run_id:
+            continue
+        payload = analysis_payload if isinstance(analysis_payload, dict) else {}
+        final_optical = payload.get("final_optical") if isinstance(payload.get("final_optical"), dict) else None
+        if final_optical is None:
+            continue
+        analysis_status = str(status or "").strip().lower()
+        if analysis_status and analysis_status != OPTICAL_ANALYSIS_STATUS_COMPLETED:
+            continue
+
+        quality_token = str(final_optical.get("quality") or "").strip().lower()
+        if quality_token == OPTICAL_FINAL_OPTICAL_QUALITY_INSUFFICIENT:
+            continue
+
+        ts = analyzed_at if isinstance(analyzed_at, datetime) else _utcnow()
+
+        hr_value = _as_number(final_optical.get("heart_rate_bpm"))
+        if hr_value is not None:
+            _put_point(
+                trend_kind="heart_rate",
+                run_id=measurement_run_id,
+                ts=ts,
+                value=hr_value,
+                encounter_id=encounter_id,
+            )
+            canonical_optical_run_metric_keys.add(("heart_rate", measurement_run_id))
+
+        spo2_value = _as_number(final_optical.get("spo2_percent"))
+        if spo2_value is not None:
+            _put_point(
+                trend_kind="spo2",
+                run_id=measurement_run_id,
+                ts=ts,
+                value=spo2_value,
+                encounter_id=encounter_id,
+            )
+            canonical_optical_run_metric_keys.add(("spo2", measurement_run_id))
+
+    history_payload = build_measurement_history(validated_user_id, 1000, include_messages=False)
+    for session in history_payload.get("sessions") or []:
+        if not isinstance(session, dict):
+            continue
+        measurement_run_id = session.get("measurement_run_id")
+        if not isinstance(measurement_run_id, str) or not measurement_run_id:
+            continue
+
+        trend_kind = session.get("measurement_id")
+        if trend_kind not in TREND_SERIES_SPECS:
+            continue
+
+        if (trend_kind, measurement_run_id) in canonical_optical_run_metric_keys:
+            continue
+
+        summary_map = session.get("summary") if isinstance(session.get("summary"), dict) else {}
+        summary_key = measurement_summary_keys.get(trend_kind)
+        if not summary_key:
+            continue
+
+        value = _as_number(summary_map.get(summary_key))
+        if value is None:
+            continue
+
+        ts = _parse_iso_datetime(session.get("ended_at")) or _parse_iso_datetime(session.get("started_at"))
+        if ts is None:
+            continue
+
+        _put_point(
+            trend_kind=trend_kind,
+            run_id=measurement_run_id,
+            ts=ts,
+            value=value,
+            encounter_id=session.get("encounter_id") if isinstance(session.get("encounter_id"), str) else None,
+        )
 
     series_by_kind: dict[str, dict[str, Any]] = {}
-    for encounter_id, ts, raw_kind, data in rows:
-        payload = data if isinstance(data, dict) else {}
-        for trend_kind, spec in TREND_SERIES_SPECS.items():
-            value = _extract_trend_value(raw_kind, payload, spec)
-            if value is None:
-                continue
+    for point in sorted(
+        canonical_points.values(),
+        key=lambda item: (item.get("kind") or "", item.get("_ts") or datetime.min.replace(tzinfo=timezone.utc), item.get("measurement_run_id") or ""),
+    ):
+        trend_kind = point["kind"]
+        spec = TREND_SERIES_SPECS.get(trend_kind)
+        if not isinstance(spec, dict):
+            continue
+        value = _as_number(point.get("value"))
+        if value is None:
+            continue
+        normalized_value = _extract_trend_value(trend_kind, {measurement_summary_keys.get(trend_kind, trend_kind): value}, spec)
+        if normalized_value is None:
+            continue
 
-            series = series_by_kind.setdefault(
-                trend_kind,
-                {
-                    "kind": trend_kind,
-                    "label": spec.get("label"),
-                    "unit": spec.get("unit"),
-                    "normal_range": spec.get("normal_range"),
-                    "points": [],
-                },
-            )
-            series["points"].append(
-                {
-                    "ts": _iso_utc(ts),
-                    "value": value,
-                    "encounter_id": encounter_id,
-                }
-            )
+        series = series_by_kind.setdefault(
+            trend_kind,
+            {
+                "kind": trend_kind,
+                "label": spec.get("label"),
+                "unit": spec.get("unit"),
+                "normal_range": spec.get("normal_range"),
+                "points": [],
+            },
+        )
+        series["points"].append(
+            {
+                "ts": point["ts"],
+                "value": normalized_value,
+                "encounter_id": point.get("encounter_id"),
+            }
+        )
 
     return {
         "series": [
@@ -8366,6 +10428,7 @@ def remove_doctor_patient(
         raise HTTPException(400, "patient_user_id must be a valid UUID") from exc
 
     with db() as conn, conn.cursor() as cur:
+        closed_consult = None
         cur.execute(
             """
             DELETE FROM doctor_patient_assignments
@@ -8375,11 +10438,21 @@ def remove_doctor_patient(
             (doctor_user_id, resolved_patient_user_id),
         )
         removed = cur.rowcount
+        if removed:
+            closed_consult = _close_consult_case_for_doctor_removal(
+                cur,
+                doctor_user_id=doctor_user_id,
+                patient_user_id=resolved_patient_user_id,
+            )
 
     if not removed:
         raise HTTPException(404, "Doctor-patient assignment not found")
 
-    return {"ok": True, "patient_user_id": resolved_patient_user_id}
+    return {
+        "ok": True,
+        "patient_user_id": resolved_patient_user_id,
+        "closed_consult_id": closed_consult["consult_case_id"] if closed_consult else None,
+    }
 
 
 @app.get("/api/doctor/patients/{patient_user_id}/notes", response_model=DoctorPatientNoteListResp)
@@ -9794,20 +11867,32 @@ def get_report(
     }
 
 @app.post("/api/devices/register", response_model=DeviceRegisterResp)
-def register_device(req: DeviceRegisterReq):
+def register_device(
+    req: DeviceRegisterReq,
+    auth_user_id: str = Depends(require_access_user_id),
+):
     with db() as conn, conn.cursor() as cur:
-        # upsert device
+        if auth_user_id != req.user_id:
+            logger.warning(
+                "device register auth mismatch auth_user_id=%s req_user_id=%s device_external_id=%s",
+                auth_user_id,
+                req.user_id,
+                req.device_external_id,
+            )
+            raise HTTPException(403, "user_id does not match the authenticated user")
+
+        # Shared-device registration: ensure the device exists and refresh metadata,
+        # but do not transfer exclusive ownership on re-registration.
         cur.execute(
             """
             INSERT INTO devices (user_id, device_external_id, platform, last_seen_at)
             VALUES (%s, %s, %s, now())
             ON CONFLICT (device_external_id)
-            DO UPDATE SET user_id=EXCLUDED.user_id,
-                          platform=COALESCE(EXCLUDED.platform, devices.platform),
+            DO UPDATE SET platform=COALESCE(EXCLUDED.platform, devices.platform),
                           last_seen_at=now()
             RETURNING id::text;
             """,
-            (req.user_id, req.device_external_id, req.platform),
+            (auth_user_id, req.device_external_id, req.platform),
         )
         (device_id,) = cur.fetchone()
 
@@ -9826,12 +11911,25 @@ def register_device(req: DeviceRegisterReq):
 
 
 @app.post("/api/sessions/start", response_model=StartSessionResp)
-def start_session(req: StartSessionReq):
+def start_session(
+    req: StartSessionReq,
+    auth_user_id: str = Depends(require_access_user_id),
+):
     encounter_id = _validated_uuid_str(req.encounter_id, "encounter_id") or str(uuid.uuid4())
     session_meta = dict(req.meta or {})
     session_meta.setdefault("source", "api_sessions_start")
 
     with db() as conn, conn.cursor() as cur:
+        if auth_user_id != req.user_id:
+            logger.warning(
+                "session start auth mismatch auth_user_id=%s req_user_id=%s device_external_id=%s encounter_id=%s",
+                auth_user_id,
+                req.user_id,
+                req.device_external_id,
+                encounter_id,
+            )
+            raise HTTPException(403, "user_id does not match the authenticated user")
+
         cur.execute("SELECT 1 FROM users WHERE id=%s LIMIT 1;", (req.user_id,))
         if not cur.fetchone():
             raise HTTPException(404, "User not found")
@@ -9864,7 +11962,7 @@ def start_session(req: StartSessionReq):
             VALUES (%s, %s, now(), %s::jsonb, %s)
             RETURNING id::text;
             """,
-            (req.user_id, device_id, _json.dumps(session_meta), encounter_id),
+            (auth_user_id, device_id, _json.dumps(session_meta), encounter_id),
         )
         (session_id,) = cur.fetchone()
 
@@ -10119,6 +12217,14 @@ def sensor_event(req: SensorEventReq):
                     measurement_run_id=measurement_run_id,
                 )
                 analysis = _apply_public_dataset_model(analysis)
+                analysis = _apply_personalization_model(
+                    cur,
+                    analysis=analysis,
+                    device_id=device_id,
+                    session_id=session_id,
+                    encounter_id=resolved_encounter_id,
+                    measurement_run_id=measurement_run_id,
+                )
                 _persist_sensor_analysis(cur, device_id=device_id, analysis=analysis)
             except Exception:
                 logger.exception(
@@ -10237,6 +12343,593 @@ def last(
         {"ts": r[0].isoformat(), "seq": r[1], "data": r[2], "measurement_run_id": r[3]}
         for r in rows
     ]
+
+
+@app.post(
+    "/api/measurements/optical/runs",
+    response_model=OpticalCaptureRunResp,
+    response_model_exclude_none=True,
+)
+def create_optical_capture_run(
+    req: OpticalCaptureRunCreateReq,
+    patient_user_id: str = Depends(require_access_user_id),
+):
+    session_id = _validated_uuid_str(req.session_id, "session_id")
+    if not session_id:
+        raise HTTPException(400, "session_id is required")
+
+    encounter_id = _validated_uuid_str(req.encounter_id, "encounter_id")
+    requested_run_id = _validated_uuid_str(req.measurement_run_id, "measurement_run_id")
+    if req.mode != OPTICAL_MEASUREMENT_MODE:
+        raise HTTPException(400, f"mode must be '{OPTICAL_MEASUREMENT_MODE}'")
+
+    started_at = req.started_at or _utcnow()
+    requested_measurements = _normalize_requested_measurements(req.requested_measurements)
+
+    with db() as conn, conn.cursor() as cur:
+        _, resolved_encounter_id = _validate_optical_capture_run_create_context(
+            cur,
+            patient_user_id=patient_user_id,
+            session_id=session_id,
+            encounter_id=encounter_id,
+            device_external_id=req.device_external_id,
+        )
+
+        if requested_run_id:
+            existing_row = _fetch_optical_capture_run_row(cur, requested_run_id)
+            if existing_row:
+                existing_payload = _serialize_optical_capture_run_row(existing_row)
+                if (
+                    existing_payload["patient_user_id"] != patient_user_id
+                    or existing_payload["session_id"] != session_id
+                    or existing_payload["device_external_id"] != req.device_external_id
+                    or existing_payload["mode"] != OPTICAL_MEASUREMENT_MODE
+                ):
+                    raise HTTPException(409, "measurement_run_id already belongs to another optical capture run")
+                return {
+                    "run": existing_payload,
+                    "created": False,
+                    "already_exists": True,
+                    "already_stopped": existing_payload["status"] == OPTICAL_RUN_STATUS_STOPPED,
+                }
+
+        cur.execute(
+            """
+            INSERT INTO optical_capture_runs (
+                measurement_run_id,
+                patient_user_id,
+                encounter_id,
+                session_id,
+                device_external_id,
+                mode,
+                status,
+                started_at,
+                sample_rate_hz,
+                requested_measurements
+            )
+            VALUES (
+                COALESCE(%s::uuid, gen_random_uuid()),
+                %s,
+                %s,
+                %s,
+                %s,
+                %s,
+                %s,
+                %s,
+                %s,
+                %s::jsonb
+            )
+            RETURNING measurement_run_id::text
+            """,
+            (
+                requested_run_id,
+                patient_user_id,
+                resolved_encounter_id,
+                session_id,
+                req.device_external_id,
+                OPTICAL_MEASUREMENT_MODE,
+                OPTICAL_RUN_STATUS_ACTIVE,
+                started_at,
+                req.sample_rate_hz,
+                _json.dumps(requested_measurements),
+            ),
+        )
+        run_id_row = cur.fetchone()
+        measurement_run_id = run_id_row[0] if run_id_row else None
+
+        if not measurement_run_id:
+            raise HTTPException(500, "Failed to create optical capture run")
+
+        run_row = _fetch_optical_capture_run_row(cur, measurement_run_id)
+        if not run_row:
+            raise HTTPException(500, "Created optical capture run could not be loaded")
+
+    return {
+        "run": _serialize_optical_capture_run_row(run_row),
+        "created": True,
+        "already_exists": False,
+        "already_stopped": False,
+    }
+
+
+@app.post(
+    "/api/measurements/optical/runs/{measurement_run_id}/chunks",
+    response_model=OpticalCaptureChunkResp,
+    response_model_exclude_none=True,
+)
+def append_optical_capture_chunk(
+    measurement_run_id: str,
+    req: OpticalCaptureChunkReq,
+    patient_user_id: str = Depends(require_access_user_id),
+):
+    validated_run_id = _validated_uuid_str(measurement_run_id, "measurement_run_id")
+    if not validated_run_id:
+        raise HTTPException(400, "measurement_run_id is required")
+
+    chunk_started_at = req.chunk_started_at or req.chunk_ended_at or _utcnow()
+    chunk_ended_at = req.chunk_ended_at or req.chunk_started_at or chunk_started_at
+    if chunk_ended_at < chunk_started_at:
+        raise HTTPException(400, "chunk_ended_at cannot be before chunk_started_at")
+
+    payload_json = jsonable_encoder(req, exclude_none=True)
+    ppg_packets = req.ppg_packets or []
+    ts1_frames = req.ts1_frames or []
+    packet_count = len(ppg_packets)
+    sample_count = sum(_estimate_optical_ppg_packet_sample_count(packet) for packet in ppg_packets)
+    first_packet_id = _extract_optical_packet_id(ppg_packets[0]) if ppg_packets else None
+    last_packet_id = _extract_optical_packet_id(ppg_packets[-1]) if ppg_packets else None
+    normalized_ts1_frames = [
+        _normalize_ts1_frame_payload(frame, fallback_received_at=chunk_started_at)
+        for frame in ts1_frames
+    ]
+    derived_checksum_failures = sum(1 for frame in normalized_ts1_frames if frame.get("checksum_ok") is False)
+    checksum_failure_count_delta = max(int(req.checksum_failure_count_delta or 0), derived_checksum_failures)
+    malformed_packet_count_delta = int(req.malformed_packet_count_delta or 0)
+    packet_loss_count_delta = int(req.packet_loss_count_delta or 0)
+    raw_waveform_available = bool(packet_count or normalized_ts1_frames)
+    latest_chunk_at = chunk_ended_at or chunk_started_at
+
+    with db() as conn, conn.cursor() as cur:
+        run_row = _fetch_optical_capture_run_row(cur, validated_run_id)
+        if not run_row:
+            raise HTTPException(404, "Optical capture run not found")
+
+        if run_row[1] != patient_user_id:
+            raise HTTPException(403, "Only the run owner can append optical capture chunks")
+        run_payload = _serialize_optical_capture_run_row(run_row)
+
+        cur.execute(
+            """
+            SELECT chunk_started_at,
+                   chunk_ended_at,
+                   packet_count,
+                   sample_count,
+                   ts1_frame_count,
+                   first_packet_id,
+                   last_packet_id,
+                   packet_loss_count_delta,
+                   payload_json
+            FROM optical_capture_chunks
+            WHERE measurement_run_id = %s
+              AND chunk_index = %s
+            LIMIT 1
+            """,
+            (validated_run_id, req.chunk_index),
+        )
+        existing_chunk_row = cur.fetchone()
+        if existing_chunk_row:
+            same_payload = (
+                existing_chunk_row[0] == chunk_started_at
+                and existing_chunk_row[1] == chunk_ended_at
+                and int(existing_chunk_row[2] or 0) == packet_count
+                and int(existing_chunk_row[3] or 0) == sample_count
+                and int(existing_chunk_row[4] or 0) == len(normalized_ts1_frames)
+                and existing_chunk_row[5] == first_packet_id
+                and existing_chunk_row[6] == last_packet_id
+                and int(existing_chunk_row[7] or 0) == packet_loss_count_delta
+                and (existing_chunk_row[8] if isinstance(existing_chunk_row[8], dict) else {}) == payload_json
+            )
+            if not same_payload:
+                raise HTTPException(409, "chunk_index already exists with different payload")
+            return {
+                "measurement_run_id": validated_run_id,
+                "chunk_index": req.chunk_index,
+                "stored": False,
+                "duplicate": True,
+                "run": run_payload,
+            }
+
+        if run_payload["status"] != OPTICAL_RUN_STATUS_ACTIVE:
+            raise HTTPException(409, "Optical capture run is not active")
+
+        cur.execute(
+            """
+            INSERT INTO optical_capture_chunks (
+                measurement_run_id,
+                chunk_index,
+                chunk_started_at,
+                chunk_ended_at,
+                packet_count,
+                sample_count,
+                ts1_frame_count,
+                first_packet_id,
+                last_packet_id,
+                packet_loss_count_delta,
+                payload_json
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+            """,
+            (
+                validated_run_id,
+                req.chunk_index,
+                chunk_started_at,
+                chunk_ended_at,
+                packet_count,
+                sample_count,
+                len(normalized_ts1_frames),
+                first_packet_id,
+                last_packet_id,
+                packet_loss_count_delta,
+                _json.dumps(payload_json),
+            ),
+        )
+
+        for frame_index, frame_payload in enumerate(normalized_ts1_frames):
+            cur.execute(
+                """
+                INSERT INTO optical_capture_ts1_frames (
+                    measurement_run_id,
+                    chunk_index,
+                    frame_index,
+                    received_at,
+                    timestamp_ms,
+                    raw_line,
+                    checksum_ok,
+                    sht_temp_c,
+                    sht_rh_percent,
+                    ens_iaq,
+                    ens_eco2_ppm,
+                    ens_temp_c,
+                    mlx_ambient_c,
+                    mlx_object_c,
+                    heart_rate_bpm,
+                    spo2_percent,
+                    red_dc,
+                    quality,
+                    parsed_payload_json
+                )
+                VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb
+                )
+                """,
+                (
+                    validated_run_id,
+                    req.chunk_index,
+                    frame_index,
+                    frame_payload.get("received_at"),
+                    frame_payload.get("timestamp_ms"),
+                    frame_payload.get("raw_line"),
+                    frame_payload.get("checksum_ok"),
+                    frame_payload.get("sht_temp_c"),
+                    frame_payload.get("sht_rh_percent"),
+                    frame_payload.get("ens_iaq"),
+                    frame_payload.get("ens_eco2_ppm"),
+                    frame_payload.get("ens_temp_c"),
+                    frame_payload.get("mlx_ambient_c"),
+                    frame_payload.get("mlx_object_c"),
+                    frame_payload.get("heart_rate_bpm"),
+                    frame_payload.get("spo2_percent"),
+                    frame_payload.get("red_dc"),
+                    frame_payload.get("quality"),
+                    _json.dumps(frame_payload.get("parsed_payload_json") or {}),
+                ),
+            )
+
+        cur.execute(
+            """
+            UPDATE optical_capture_runs
+            SET raw_waveform_available = optical_capture_runs.raw_waveform_available OR %s,
+                total_chunks = optical_capture_runs.total_chunks + 1,
+                total_packets = optical_capture_runs.total_packets + %s,
+                total_samples = optical_capture_runs.total_samples + %s,
+                ts1_frame_count = optical_capture_runs.ts1_frame_count + %s,
+                packet_loss_count = optical_capture_runs.packet_loss_count + %s,
+                checksum_failure_count = optical_capture_runs.checksum_failure_count + %s,
+                malformed_packet_count = optical_capture_runs.malformed_packet_count + %s,
+                latest_chunk_at = GREATEST(COALESCE(optical_capture_runs.latest_chunk_at, %s), %s)
+            WHERE measurement_run_id = %s
+            """,
+            (
+                raw_waveform_available,
+                packet_count,
+                sample_count,
+                len(normalized_ts1_frames),
+                packet_loss_count_delta,
+                checksum_failure_count_delta,
+                malformed_packet_count_delta,
+                latest_chunk_at,
+                latest_chunk_at,
+                validated_run_id,
+            ),
+        )
+
+        updated_run_row = _fetch_optical_capture_run_row(cur, validated_run_id)
+        if not updated_run_row:
+            raise HTTPException(500, "Updated optical capture run could not be loaded")
+
+    return {
+        "measurement_run_id": validated_run_id,
+        "chunk_index": req.chunk_index,
+        "stored": True,
+        "duplicate": False,
+        "run": _serialize_optical_capture_run_row(updated_run_row),
+    }
+
+
+@app.post(
+    "/api/measurements/optical/runs/{measurement_run_id}/stop",
+    response_model=OpticalCaptureRunResp,
+    response_model_exclude_none=True,
+)
+def stop_optical_capture_run(
+    measurement_run_id: str,
+    req: OpticalCaptureStopReq,
+    auth_user_id: str = Depends(require_access_user_id),
+):
+    validated_run_id = _validated_uuid_str(measurement_run_id, "measurement_run_id")
+    if not validated_run_id:
+        raise HTTPException(400, "measurement_run_id is required")
+
+    with db() as conn, conn.cursor() as cur:
+        run_row = _fetch_optical_capture_run_row(cur, validated_run_id)
+        if not run_row:
+            raise HTTPException(404, "Optical capture run not found")
+
+        if run_row[1] != auth_user_id:
+            raise HTTPException(403, "Only the run owner can stop the optical capture run")
+        run_payload = _serialize_optical_capture_run_row(run_row)
+        if run_payload["status"] == OPTICAL_RUN_STATUS_STOPPED:
+            analysis_payload = _resolve_optical_capture_run_analysis(cur, run_payload=run_payload)
+            return {
+                "run": run_payload,
+                "analysis": analysis_payload,
+                "created": False,
+                "already_exists": True,
+                "already_stopped": True,
+            }
+
+        stopped_at = req.stopped_at or _utcnow()
+        if stopped_at < run_payload["started_at"]:
+            raise HTTPException(400, "stopped_at cannot be before started_at")
+
+        cur.execute(
+            """
+            UPDATE optical_capture_runs
+            SET status = %s,
+                stopped_at = %s
+            WHERE measurement_run_id = %s
+            """,
+            (OPTICAL_RUN_STATUS_STOPPED, stopped_at, validated_run_id),
+        )
+        updated_run_row = _fetch_optical_capture_run_row(cur, validated_run_id)
+        if not updated_run_row:
+            raise HTTPException(500, "Stopped optical capture run could not be loaded")
+        updated_run_payload = _serialize_optical_capture_run_row(updated_run_row)
+        analysis_payload = _resolve_optical_capture_run_analysis(cur, run_payload=updated_run_payload)
+
+    return {
+        "run": updated_run_payload,
+        "analysis": analysis_payload,
+        "created": False,
+        "already_exists": True,
+        "already_stopped": False,
+    }
+
+
+@app.get(
+    "/api/measurements/optical/runs/{measurement_run_id}",
+    response_model=OpticalCaptureRunResp,
+    response_model_exclude_none=True,
+)
+def get_optical_capture_run(
+    measurement_run_id: str,
+    auth_user_id: str = Depends(require_access_user_id),
+):
+    validated_run_id = _validated_uuid_str(measurement_run_id, "measurement_run_id")
+    if not validated_run_id:
+        raise HTTPException(400, "measurement_run_id is required")
+
+    with db() as conn, conn.cursor() as cur:
+        run_row = _fetch_optical_capture_run_row(cur, validated_run_id)
+        if not run_row:
+            raise HTTPException(404, "Optical capture run not found")
+        _authorize_user_read_access(auth_user_id, run_row[1])
+        run_payload = _serialize_optical_capture_run_row(run_row)
+        analysis_payload = _resolve_optical_capture_run_analysis(cur, run_payload=run_payload)
+
+    return {
+        "run": run_payload,
+        "analysis": analysis_payload,
+        "created": False,
+        "already_exists": True,
+        "already_stopped": bool(run_row[8] or run_row[6] == OPTICAL_RUN_STATUS_STOPPED),
+    }
+
+
+@app.get(
+    "/api/measurement-runs/{measurement_run_id}/analysis",
+    response_model=MeasurementRunAnalysisResp,
+    response_model_exclude_none=True,
+)
+def get_measurement_run_analysis(
+    measurement_run_id: str,
+    auth_user_id: str = Depends(require_access_user_id),
+):
+    validated_run_id = _validated_uuid_str(measurement_run_id, "measurement_run_id")
+    if not validated_run_id:
+        raise HTTPException(400, "measurement_run_id is required")
+
+    with db() as conn, conn.cursor() as cur:
+        run_row = _fetch_optical_capture_run_row(cur, validated_run_id)
+        if not run_row:
+            raise HTTPException(404, "Optical capture run not found")
+        _authorize_user_read_access(auth_user_id, run_row[1])
+        run_payload = _serialize_optical_capture_run_row(run_row)
+        return _resolve_optical_capture_run_analysis(cur, run_payload=run_payload)
+
+
+@app.get(
+    "/api/measurements/optical/runs/{measurement_run_id}/waveform",
+    response_model=OpticalWaveformResp,
+    response_model_exclude_none=True,
+)
+def get_optical_capture_waveform(
+    measurement_run_id: str,
+    from_ts: str | None = Query(None),
+    to_ts: str | None = Query(None),
+    max_points: int = Query(OPTICAL_WAVEFORM_DEFAULT_MAX_POINTS, ge=10, le=OPTICAL_WAVEFORM_MAX_POINTS),
+    series: str | None = Query(None),
+    resolution: str | None = Query(None),
+    auth_user_id: str = Depends(require_access_user_id),
+):
+    validated_run_id = _validated_uuid_str(measurement_run_id, "measurement_run_id")
+    if not validated_run_id:
+        raise HTTPException(400, "measurement_run_id is required")
+
+    from_dt = _parse_datetime_like(from_ts) if from_ts else None
+    if from_ts and from_dt is None:
+        raise HTTPException(400, "from_ts must be an ISO 8601 timestamp or epoch milliseconds")
+    to_dt = _parse_datetime_like(to_ts) if to_ts else None
+    if to_ts and to_dt is None:
+        raise HTTPException(400, "to_ts must be an ISO 8601 timestamp or epoch milliseconds")
+    if from_dt and to_dt and to_dt < from_dt:
+        raise HTTPException(400, "to_ts cannot be before from_ts")
+
+    requested_series = _parse_optical_series_query(series)
+    resolution_ms = _parse_optical_resolution_ms(resolution)
+
+    with db() as conn, conn.cursor() as cur:
+        run_row = _fetch_optical_capture_run_row(cur, validated_run_id)
+        if not run_row:
+            raise HTTPException(404, "Optical capture run not found")
+        _authorize_user_read_access(auth_user_id, run_row[1])
+        return _build_optical_waveform_payload(
+            cur,
+            measurement_run_id=validated_run_id,
+            from_dt=from_dt,
+            to_dt=to_dt,
+            max_points=max_points,
+            requested_series=requested_series,
+            resolution_ms=resolution_ms,
+        )
+
+
+@app.get("/api/measurements/optical/runs/{measurement_run_id}/stream")
+async def stream_optical_capture_waveform(
+    request: Request,
+    measurement_run_id: str,
+    from_ts: str | None = Query(None),
+    to_ts: str | None = Query(None),
+    max_points: int = Query(OPTICAL_WAVEFORM_DEFAULT_MAX_POINTS, ge=10, le=OPTICAL_WAVEFORM_MAX_POINTS),
+    series: str | None = Query(None),
+    resolution: str | None = Query(None),
+    poll_seconds: float = Query(STREAM_DEFAULT_POLL_SECONDS, ge=1.0, le=STREAM_MAX_POLL_SECONDS),
+    auth_user_id: str = Depends(require_access_user_id),
+):
+    validated_run_id = _validated_uuid_str(measurement_run_id, "measurement_run_id")
+    if not validated_run_id:
+        raise HTTPException(400, "measurement_run_id is required")
+
+    from_dt = _parse_datetime_like(from_ts) if from_ts else None
+    if from_ts and from_dt is None:
+        raise HTTPException(400, "from_ts must be an ISO 8601 timestamp or epoch milliseconds")
+    to_dt = _parse_datetime_like(to_ts) if to_ts else None
+    if to_ts and to_dt is None:
+        raise HTTPException(400, "to_ts must be an ISO 8601 timestamp or epoch milliseconds")
+    if from_dt and to_dt and to_dt < from_dt:
+        raise HTTPException(400, "to_ts cannot be before from_ts")
+
+    requested_series = _parse_optical_series_query(series)
+    resolution_ms = _parse_optical_resolution_ms(resolution)
+    effective_poll_seconds = _stream_poll_seconds(poll_seconds)
+
+    def _load_stream_payload() -> tuple[tuple[Any, ...], dict[str, Any]]:
+        with db() as conn, conn.cursor() as cur:
+            run_row = _fetch_optical_capture_run_row(cur, validated_run_id)
+            if not run_row:
+                raise HTTPException(404, "Optical capture run not found")
+            _authorize_user_read_access(auth_user_id, run_row[1])
+            run_payload = _serialize_optical_capture_run_row(run_row)
+            signature = (
+                run_payload["status"],
+                _iso(run_payload.get("stopped_at")),
+                _iso(run_payload.get("latest_chunk_at")),
+                run_payload["total_chunks"],
+                run_payload["total_packets"],
+                run_payload["total_samples"],
+                run_payload["ts1_frame_count"],
+                run_payload["packet_loss_count"],
+                run_payload["checksum_failure_count"],
+                run_payload["malformed_packet_count"],
+            )
+            waveform_payload = _build_optical_waveform_payload(
+                cur,
+                measurement_run_id=validated_run_id,
+                from_dt=from_dt,
+                to_dt=to_dt,
+                max_points=max_points,
+                requested_series=requested_series,
+                resolution_ms=resolution_ms,
+            )
+            return signature, waveform_payload
+
+    initial_signature, initial_payload = await run_in_threadpool(_load_stream_payload)
+
+    async def event_stream():
+        last_signature = initial_signature
+        last_payload = initial_payload
+        last_heartbeat = time.monotonic()
+        yield _sse_frame(
+            "ready",
+            {
+                "server_time": _utcnow(),
+                "poll_seconds": effective_poll_seconds,
+                "measurement_run_id": validated_run_id,
+            },
+        )
+        yield _sse_frame("snapshot", initial_payload)
+
+        while True:
+            if await request.is_disconnected():
+                break
+            try:
+                current_signature, current_payload = await run_in_threadpool(_load_stream_payload)
+            except HTTPException as exc:
+                yield _sse_frame("error", {"detail": exc.detail, "status_code": exc.status_code})
+                break
+
+            if current_signature != last_signature:
+                delta_payload = _compute_optical_waveform_delta(last_payload, current_payload)
+                delta_payload["server_time"] = _utcnow()
+                yield _sse_frame("changes", delta_payload)
+                last_signature = current_signature
+                last_payload = current_payload
+                last_heartbeat = time.monotonic()
+            elif time.monotonic() - last_heartbeat >= STREAM_HEARTBEAT_SECONDS:
+                yield b": heartbeat\n\n"
+                last_heartbeat = time.monotonic()
+
+            await asyncio.sleep(effective_poll_seconds)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 @app.get(
     "/api/measurements/history",
