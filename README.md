@@ -211,6 +211,7 @@ The current public datasets do not cover `air_quality_index` directly, so `AQI` 
 | `POST` | `/api/images/analyze` | Runs non-diagnostic visual anomaly screening, stores overlay metadata/history, and returns labels + boxes. | Accepts either `image_id` or multipart `file`; `overlay_preview_base64` is transient response-only and object-storage keys are kept internal. |
 | `GET` | `/api/images/history` | Returns persisted visual-screening history for the authenticated user. | Requires access token; supports `limit` and optional `user_id` (must match token subject). |
 | `GET` | `/api/images/analysis` | Returns a persisted visual-screening result for a given `image_id`. | Requires access token; query params: `image_id`, optional `user_id` (must match token subject). |
+| `DELETE` | `/api/images/{image_id}` | Deletes the authenticated user's own visual analysis and its linked source/overlay image records. | Requires access token; use the history item's `source_image_id` as the delete target. Passing the overlay image id also resolves to the same analysis group. Returns `{ok, analysis_id, source_image_id, overlay_image_id}`. |
 | `GET` | `/api/images/list` | Lists images by device or session. | Query params: `device_external_id`, `session_id`, `limit`. |
 | `POST` | `/api/files/upload` | Uploads a PDF medical history file for a user. | Requires access token; PDF only; size limited by `PROFILE_FILE_MAX_MB`. |
 

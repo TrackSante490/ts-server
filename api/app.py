@@ -13238,6 +13238,15 @@ def _read_image_object_bytes(*, bucket: str | None, key: str | None) -> bytes | 
         return None
 
 
+def _delete_image_object(*, bucket: str | None, key: str | None) -> None:
+    if not bucket or not key:
+        return
+    try:
+        S3.delete_object(Bucket=bucket, Key=key)
+    except Exception as exc:
+        logger.warning("Unable to delete image object s3://%s/%s: %s", bucket, key, exc)
+
+
 def _build_image_preview_base64(*, bucket: str | None, key: str | None) -> str | None:
     image_bytes = _read_image_object_bytes(bucket=bucket, key=key)
     if not image_bytes:
@@ -13493,6 +13502,13 @@ class ImageAnalysisHistoryResp(BaseModel):
 
 class ImageAnalysisByImageResp(BaseModel):
     analysis: ImageAnalysisHistoryItem
+
+
+class ImageAnalysisDeleteResp(BaseModel):
+    ok: bool = True
+    analysis_id: int
+    source_image_id: int
+    overlay_image_id: int | None = None
 
 DoctorPatientDashboardResp.model_rebuild()
 
@@ -13920,6 +13936,48 @@ def _fetch_image_analysis_history_rows(
     return cur.fetchall()
 
 
+def _fetch_owned_image_analysis_delete_row(
+    cur,
+    *,
+    user_id: str,
+    image_id: int,
+) -> tuple[Any, ...] | None:
+    cur.execute(
+        """
+        SELECT ia.id,
+               ia.source_image_id,
+               ia.overlay_image_id,
+               src.bucket,
+               src.key,
+               ovl.bucket,
+               ovl.key
+        FROM image_analyses ia
+        JOIN images src ON src.id = ia.source_image_id
+        LEFT JOIN images ovl ON ovl.id = ia.overlay_image_id
+        LEFT JOIN user_sessions us ON us.id = COALESCE(ia.session_id, src.session_id)
+        LEFT JOIN devices d ON d.id = COALESCE(ia.device_id, src.device_id)
+        WHERE (
+                COALESCE(ia.user_id, us.user_id, d.user_id) = %s::uuid
+                OR (
+                    COALESCE(ia.user_id, us.user_id, d.user_id) IS NULL
+                    AND ia.encounter_id IS NOT NULL
+                    AND EXISTS (
+                        SELECT 1
+                        FROM user_sessions ux
+                        WHERE ux.user_id = %s::uuid
+                          AND ux.encounter_id = ia.encounter_id
+                    )
+                )
+              )
+          AND (ia.source_image_id = %s OR ia.overlay_image_id = %s)
+        ORDER BY ia.analyzed_at DESC, ia.id DESC
+        LIMIT 1
+        """,
+        (user_id, user_id, image_id, image_id),
+    )
+    return cur.fetchone()
+
+
 @app.get(
     "/api/images/history",
     response_model=ImageAnalysisHistoryResp,
@@ -13994,6 +14052,51 @@ def image_analysis_by_image_id(
             include_previews=include_previews,
             target_user_id=target_user_id,
         )
+    }
+
+
+@app.delete(
+    "/api/images/{image_id}",
+    response_model=ImageAnalysisDeleteResp,
+    response_model_exclude_none=True,
+)
+def delete_image_analysis(
+    image_id: int,
+    auth_user_id: str = Depends(require_access_user_id),
+):
+    if image_id < 1:
+        raise HTTPException(400, "image_id must be positive")
+
+    with db() as conn, conn.cursor() as cur:
+        row = _fetch_owned_image_analysis_delete_row(
+            cur,
+            user_id=auth_user_id,
+            image_id=image_id,
+        )
+        if not row:
+            raise HTTPException(404, "No visual analysis found for image_id")
+
+        analysis_id = int(row[0])
+        source_image_id = int(row[1])
+        overlay_image_id = int(row[2]) if row[2] is not None else None
+        source_bucket = row[3]
+        source_key = row[4]
+        overlay_bucket = row[5]
+        overlay_key = row[6]
+
+        cur.execute("DELETE FROM image_analyses WHERE id = %s", (analysis_id,))
+        if overlay_image_id is not None:
+            cur.execute("DELETE FROM images WHERE id = %s", (overlay_image_id,))
+        cur.execute("DELETE FROM images WHERE id = %s", (source_image_id,))
+
+    for bucket, key in {(source_bucket, source_key), (overlay_bucket, overlay_key)}:
+        _delete_image_object(bucket=bucket, key=key)
+
+    return {
+        "ok": True,
+        "analysis_id": analysis_id,
+        "source_image_id": source_image_id,
+        "overlay_image_id": overlay_image_id,
     }
 
 
